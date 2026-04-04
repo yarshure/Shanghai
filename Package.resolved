@@ -1,5 +1,5 @@
 {
-  "originHash" : "8bdedbef87d6df64aeed1825cbb837a2203e8375207391663a84f8749692c71a",
+  "originHash" : "82a73e3e1b2e4d5c343b5f3158b91cadd0e726584cf3bd4171f22bddade187e1",
   "pins" : [
     {
       "identity" : "liso",
@@ -8,6 +8,24 @@
       "state" : {
         "branch" : "main",
         "revision" : "cb1eb10fc325e4cd80782bce8c61cedfc0329ffc"
+      }
+    },
+    {
+      "identity" : "snappy.swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/awxkee/snappy.swift",
+      "state" : {
+        "revision" : "4ce38540e8131f75682a9dd8b36e65ec3979f645",
+        "version" : "1.0.0"
+      }
+    },
+    {
+      "identity" : "swift-sodium",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/jedisct1/swift-sodium.git",
+      "state" : {
+        "revision" : "e7e799cd1eaa4d0f6d3eab56832e7f4b377f4a4f",
+        "version" : "0.10.0"
       }
     }
   ],

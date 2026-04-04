@@ -1,5 +1,6 @@
 import Dispatch
 import Foundation
+import snappy
 
 public protocol KcpTunStreamHandler: AnyObject {
     var sessionID: UInt32 { get }
@@ -15,6 +16,7 @@ public struct KcpTunConnectorConfiguration: Sendable {
     public var keepAliveInterval: TimeInterval
     public var maxFrameSize: Int
     public var maxStreamBuffer: Int
+    public var compressionEnabled: Bool
     public var bootstrapSessionID: UInt32
 
     public init(
@@ -24,6 +26,7 @@ public struct KcpTunConnectorConfiguration: Sendable {
         keepAliveInterval: TimeInterval = 10,
         maxFrameSize: Int = 4_096,
         maxStreamBuffer: Int = 65_536,
+        compressionEnabled: Bool = false,
         bootstrapSessionID: UInt32 = 0
     ) {
         self.endpoint = endpoint
@@ -32,6 +35,7 @@ public struct KcpTunConnectorConfiguration: Sendable {
         self.keepAliveInterval = keepAliveInterval
         self.maxFrameSize = maxFrameSize
         self.maxStreamBuffer = maxStreamBuffer
+        self.compressionEnabled = compressionEnabled
         self.bootstrapSessionID = bootstrapSessionID
     }
 }
@@ -44,6 +48,8 @@ public final class KcpTunConnector: @unchecked Sendable {
     private let queue: DispatchQueue
     private let session: KcpSession
     private var decoder: KcpFrameDecoder
+    private var compressionEncoder: KcpSnappyFramedEncoder?
+    private var compressionDecoder: KcpSnappyFramedDecoder?
     private var keepAliveTimer: DispatchSourceTimer?
     private var streams: [UInt32: KcpTunStreamHandler] = [:]
     private var pendingStreams = Set<UInt32>()
@@ -61,6 +67,8 @@ public final class KcpTunConnector: @unchecked Sendable {
         self.configuration = configuration
         self.queue = DispatchQueue(label: "shanghai.kcptun.connector.\(configuration.endpoint.host).\(configuration.endpoint.port)")
         self.decoder = KcpFrameDecoder(expectedVersion: configuration.smuxVersion.rawValue)
+        self.compressionEncoder = configuration.compressionEnabled ? KcpSnappyFramedEncoder() : nil
+        self.compressionDecoder = configuration.compressionEnabled ? KcpSnappyFramedDecoder() : nil
         self.session = KcpSession(
             remoteHost: configuration.endpoint.host,
             remotePort: configuration.endpoint.port,
@@ -145,8 +153,24 @@ public final class KcpTunConnector: @unchecked Sendable {
     private func handleInboundPayload(_ data: Data) {
         lastRemoteActivity = Date()
         KcpLog.trace("connector inbound bytes=\(data.count) endpoint=\(configuration.endpoint)")
-        decoder.append(data)
+        if configuration.compressionEnabled {
+            do {
+                compressionDecoder?.append(data)
+                let chunks = try compressionDecoder?.readAvailable() ?? []
+                for chunk in chunks {
+                    processInboundSmuxBytes(chunk)
+                }
+            } catch {
+                KcpLog.warning("drop compressed payload endpoint=\(configuration.endpoint) error=\(error)")
+            }
+            return
+        }
 
+        processInboundSmuxBytes(data)
+    }
+
+    private func processInboundSmuxBytes(_ data: Data) {
+        decoder.append(data)
         while true {
             let result = decoder.nextFrame()
             guard let frame = result.frame else {
@@ -201,6 +225,10 @@ public final class KcpTunConnector: @unchecked Sendable {
 
         case .psh:
             markStreamEstablished(frame.sessionID)
+            if error == .bodyNotFull {
+                KcpLog.trace("partial payload sid=\(frame.sessionID) endpoint=\(configuration.endpoint)")
+                return
+            }
             if let payload = frame.payload, !payload.isEmpty {
                 KcpLog.trace("deliver payload sid=\(frame.sessionID) bytes=\(payload.count) endpoint=\(configuration.endpoint)")
                 KcpLog.hexDump("connector plain recv sid=\(frame.sessionID)", data: payload)
@@ -208,10 +236,6 @@ public final class KcpTunConnector: @unchecked Sendable {
                 if configuration.smuxVersion == .v2 {
                     sendWindowUpdate(for: frame.sessionID, bytesConsumed: payload.count)
                 }
-            }
-            if error == .bodyNotFull {
-                KcpLog.trace("partial payload sid=\(frame.sessionID) endpoint=\(configuration.endpoint)")
-                return
             }
 
         case .upd:
@@ -235,8 +259,19 @@ public final class KcpTunConnector: @unchecked Sendable {
     }
 
     private func sendRawData(_ data: Data, command: KcpFrameCommand, sessionID: UInt32) {
+        var encoded = Data()
         splitKcpFrames(data, command: command, sessionID: sessionID, maxFrameSize: configuration.maxFrameSize)
-            .forEach(sendFrame)
+            .forEach { frame in
+                var frame = frame
+                frame.version = configuration.smuxVersion.rawValue
+                encoded.append(frame.encoded())
+            }
+
+        do {
+            session.send(try encodeTransportBytes(encoded))
+        } catch {
+            KcpLog.error("compress send failed sid=\(sessionID) endpoint=\(configuration.endpoint) error=\(error)")
+        }
     }
 
     private func sendFrame(_ frame: KcpFrame) {
@@ -245,7 +280,11 @@ public final class KcpTunConnector: @unchecked Sendable {
         let encoded = frame.encoded()
         KcpLog.trace("send frame sid=\(frame.sessionID) cmd=\(frame.command.rawValue) bytes=\(frame.payload?.count ?? 0) endpoint=\(configuration.endpoint)")
         KcpLog.hexDump("smux frame send sid=\(frame.sessionID) cmd=\(frame.command.rawValue)", data: encoded)
-        session.send(encoded)
+        do {
+            session.send(try encodeTransportBytes(encoded))
+        } catch {
+            KcpLog.error("compress control frame failed sid=\(frame.sessionID) endpoint=\(configuration.endpoint) error=\(error)")
+        }
     }
 
     private func sendFin(_ sessionID: UInt32) {
@@ -311,6 +350,8 @@ public final class KcpTunConnector: @unchecked Sendable {
         started = false
         controlChannelReady = false
         decoder = KcpFrameDecoder(expectedVersion: configuration.smuxVersion.rawValue)
+        compressionEncoder = configuration.compressionEnabled ? KcpSnappyFramedEncoder() : nil
+        compressionDecoder = configuration.compressionEnabled ? KcpSnappyFramedDecoder() : nil
         streams.removeAll(keepingCapacity: false)
         pendingStreams.removeAll(keepingCapacity: false)
         establishedStreams.removeAll(keepingCapacity: false)
@@ -332,5 +373,13 @@ public final class KcpTunConnector: @unchecked Sendable {
         if removeStream {
             streams.removeValue(forKey: sessionID)
         }
+    }
+
+    private func encodeTransportBytes(_ data: Data) throws -> Data {
+        guard configuration.compressionEnabled else { return data }
+        guard var compressionEncoder else { return data }
+        let encoded = try compressionEncoder.encode(data)
+        self.compressionEncoder = compressionEncoder
+        return encoded
     }
 }

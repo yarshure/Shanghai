@@ -18,6 +18,8 @@ public struct KcpConfiguration: Sendable {
     public var resend: Int32
     public var disableCongestionControl: Int32
     public var streamMode: Bool
+    public var preSharedKey: String
+    public var crypt: KcpPacketCryptoMethod
 
     public init(
         conversationID: UInt32 = UInt32.random(in: 1...UInt32.max),
@@ -28,7 +30,9 @@ public struct KcpConfiguration: Sendable {
         interval: Int32 = 20,
         resend: Int32 = 2,
         disableCongestionControl: Int32 = 1,
-        streamMode: Bool = true
+        streamMode: Bool = true,
+        preSharedKey: String = "it's a secrect",
+        crypt: KcpPacketCryptoMethod = .none
     ) {
         self.conversationID = conversationID
         self.mtu = mtu
@@ -39,6 +43,8 @@ public struct KcpConfiguration: Sendable {
         self.resend = resend
         self.disableCongestionControl = disableCongestionControl
         self.streamMode = streamMode
+        self.preSharedKey = preSharedKey
+        self.crypt = crypt
     }
 }
 
@@ -69,6 +75,9 @@ public final class KcpSession: @unchecked Sendable {
     private var started = false
     private var stopped = false
     private var receiveBuffer = [UInt8](repeating: 0, count: 65_535)
+    private var packetCodec: KcpPacketCodec?
+
+    private static let kcpOverhead = 24
 
     public init(
         remoteHost: String,
@@ -117,6 +126,7 @@ public final class KcpSession: @unchecked Sendable {
                 configuration.disableCongestionControl
             )
             rawKcp.pointee.stream = configuration.streamMode ? 1 : 0
+            packetCodec = try? KcpPacketCodec(crypt: configuration.crypt, password: configuration.preSharedKey)
 
             installReadSource()
             installUpdateTimer()
@@ -143,7 +153,10 @@ public final class KcpSession: @unchecked Sendable {
                 KcpLog.error("ikcp_send failed result=\(result) remote=\(self.remoteHost):\(self.remotePort)")
                 return
             }
+            self.logKcpState("after send queued bytes=\(data.count)")
             ikcp_flush(rawKcp)
+            self.logKcpState("after flush")
+            self.updateKcpNow()
             self.scheduleNextUpdate()
         }
     }
@@ -195,13 +208,23 @@ public final class KcpSession: @unchecked Sendable {
             }
 
             if count > 0 {
+                let packet = Data(receiveBuffer.prefix(count))
                 KcpLog.trace("socket recv bytes=\(count) remote=\(remoteHost):\(remotePort)")
-                KcpLog.hexDump("udp recv", data: Data(receiveBuffer.prefix(count)))
-                receiveBuffer.withUnsafeBytes { bytes in
-                    guard let baseAddress = bytes.bindMemory(to: Int8.self).baseAddress else {
-                        return
+                KcpLog.hexDump("udp recv", data: packet)
+                do {
+                    let payload = try decodePacket(packet)
+                    logKcpSegments("udp recv payload", data: payload)
+                    payload.withUnsafeBytes { bytes in
+                        guard let baseAddress = bytes.bindMemory(to: Int8.self).baseAddress else {
+                            return
+                        }
+                        let inputResult = ikcp_input(rawKcp, baseAddress, Int(bytes.count))
+                        KcpLog.trace("ikcp_input result=\(inputResult) payloadBytes=\(bytes.count) remote=\(remoteHost):\(remotePort)")
                     }
-                    _ = ikcp_input(rawKcp, baseAddress, count)
+                    logKcpState("after input")
+                    updateKcpNow()
+                } catch {
+                    KcpLog.warning("drop invalid udp packet remote=\(remoteHost):\(remotePort) error=\(error)")
                 }
                 drainKcpReceiveQueue()
                 scheduleNextUpdate()
@@ -226,20 +249,26 @@ public final class KcpSession: @unchecked Sendable {
     private func handleUpdateTimer() {
         guard let rawKcp = rawKcp, started, !stopped else { return }
         ikcp_update(rawKcp, Self.currentMilliseconds())
+        logKcpState("after timer update")
         drainKcpReceiveQueue()
         scheduleNextUpdate()
     }
 
     private func drainKcpReceiveQueue() {
         guard let rawKcp = rawKcp else { return }
+        updateKcpNow()
+        logKcpState("before recv drain")
 
         while true {
+            let peekSize = ikcp_peeksize(rawKcp)
+            KcpLog.trace("ikcp_peeksize=\(peekSize) remote=\(remoteHost):\(remotePort)")
             let received = receiveBuffer.withUnsafeMutableBytes { bytes -> Int32 in
                 guard let baseAddress = bytes.bindMemory(to: Int8.self).baseAddress else {
                     return -1
                 }
                 return ikcp_recv(rawKcp, baseAddress, Int32(bytes.count))
             }
+            KcpLog.trace("ikcp_recv result=\(received) remote=\(remoteHost):\(remotePort)")
 
             guard received > 0 else { break }
             let data = Data(receiveBuffer.prefix(Int(received)))
@@ -248,7 +277,30 @@ public final class KcpSession: @unchecked Sendable {
             callbackQueue.async { [onReceive] in
                 onReceive?(data)
             }
+            updateKcpNow()
+            logKcpState("after recv bytes=\(received)")
         }
+    }
+
+    private func updateKcpNow() {
+        guard let rawKcp = rawKcp, started, !stopped else { return }
+        ikcp_update(rawKcp, Self.currentMilliseconds())
+        logKcpState("after immediate update")
+    }
+
+    private func logKcpState(_ context: String) {
+        guard let rawKcp = rawKcp, started, !stopped else { return }
+        let peekSize = ikcp_peeksize(rawKcp)
+        let waitSend = ikcp_waitsnd(rawKcp)
+        let sndNxt = rawKcp.pointee.snd_nxt
+        let sndUna = rawKcp.pointee.snd_una
+        let rcvNxt = rawKcp.pointee.rcv_nxt
+        let cwnd = rawKcp.pointee.cwnd
+        let remoteWnd = rawKcp.pointee.rmt_wnd
+        let rxRto = rawKcp.pointee.rx_rto
+        KcpLog.trace(
+            "kcp state \(context) peek=\(peekSize) waitsnd=\(waitSend) snd_nxt=\(sndNxt) snd_una=\(sndUna) rcv_nxt=\(rcvNxt) cwnd=\(cwnd) rmt_wnd=\(remoteWnd) rx_rto=\(rxRto) remote=\(remoteHost):\(remotePort)"
+        )
     }
 
     private func scheduleNextUpdate() {
@@ -261,9 +313,21 @@ public final class KcpSession: @unchecked Sendable {
 
     fileprivate func writeKcpPacket(_ buffer: UnsafePointer<Int8>, length: Int32) -> Int32 {
         guard socketDescriptor >= 0 else { return -1 }
-        let data = Data(bytes: buffer, count: Int(length))
+        let payload = Data(bytes: buffer, count: Int(length))
+        let data: Data
+        do {
+            data = try encodePacket(payload)
+        } catch {
+            KcpLog.error("udp packet encode failed remote=\(remoteHost):\(remotePort) error=\(error)")
+            return -1
+        }
         KcpLog.hexDump("udp send", data: data)
-        let sent = Darwin.send(socketDescriptor, buffer, Int(length), 0)
+        if let plaintext = try? decodePacket(data) {
+            logKcpSegments("udp send payload", data: plaintext)
+        }
+        let sent = data.withUnsafeBytes { bytes in
+            Darwin.send(socketDescriptor, bytes.baseAddress, data.count, 0)
+        }
         if sent < 0 {
             KcpLog.error("udp send failed errno=\(errno) remote=\(remoteHost):\(remotePort)")
             return -1
@@ -292,6 +356,7 @@ public final class KcpSession: @unchecked Sendable {
             ikcp_release(rawKcp)
             kcp = nil
         }
+        packetCodec = nil
 
         if socketDescriptor >= 0 {
             _ = close(socketDescriptor)
@@ -360,6 +425,16 @@ public final class KcpSession: @unchecked Sendable {
         UInt32((DispatchTime.now().uptimeNanoseconds / 1_000_000) & 0xffff_ffff)
     }
 
+    private func encodePacket(_ payload: Data) throws -> Data {
+        guard let packetCodec else { return payload }
+        return try packetCodec.encode(payload)
+    }
+
+    private func decodePacket(_ packet: Data) throws -> Data {
+        guard let packetCodec else { return packet }
+        return try packetCodec.decode(packet)
+    }
+
     private static var socketTypeDatagram: Int32 {
 #if canImport(Darwin)
         Int32(SOCK_DGRAM)
@@ -395,6 +470,110 @@ public final class KcpSession: @unchecked Sendable {
         }
         guard nameInfo == 0 else { return nil }
         return "\(String(cString: hostBuffer)):\(String(cString: serviceBuffer))"
+    }
+
+    private func logKcpSegments(_ label: String, data: Data) {
+        let segments = Self.parseKcpSegments(data)
+        guard !segments.isEmpty else {
+            KcpLog.trace("\(label) segments=0 bytes=\(data.count) remote=\(remoteHost):\(remotePort)")
+            return
+        }
+
+        for (index, segment) in segments.enumerated() {
+            let command = Self.kcpCommandName(segment.cmd)
+            let smuxSummary = Self.parseSmuxSummary(segment.payload)
+            KcpLog.trace(
+                "\(label) segment[\(index)] conv=\(segment.conv) cmd=\(command)(\(segment.cmd)) frg=\(segment.frg) wnd=\(segment.wnd) ts=\(segment.ts) sn=\(segment.sn) una=\(segment.una) len=\(segment.length)\(smuxSummary.map { " \($0)" } ?? "") remote=\(remoteHost):\(remotePort)"
+            )
+        }
+    }
+
+    private static func parseKcpSegments(_ data: Data) -> [ParsedKcpSegment] {
+        var segments: [ParsedKcpSegment] = []
+        var offset = 0
+        while offset + kcpOverhead <= data.count {
+            let conv = data.loadUInt32LE(at: offset)
+            let cmd = data[offset + 4]
+            let frg = data[offset + 5]
+            let wnd = data.loadUInt16LE(at: offset + 6)
+            let ts = data.loadUInt32LE(at: offset + 8)
+            let sn = data.loadUInt32LE(at: offset + 12)
+            let una = data.loadUInt32LE(at: offset + 16)
+            let length = data.loadUInt32LE(at: offset + 20)
+            let payloadStart = offset + kcpOverhead
+            let payloadEnd = payloadStart + Int(length)
+            guard payloadEnd <= data.count else { break }
+            let payload = Data(data[payloadStart..<payloadEnd])
+            segments.append(
+                ParsedKcpSegment(
+                    conv: conv,
+                    cmd: cmd,
+                    frg: frg,
+                    wnd: wnd,
+                    ts: ts,
+                    sn: sn,
+                    una: una,
+                    length: length,
+                    payload: payload
+                )
+            )
+            offset = payloadEnd
+        }
+        return segments
+    }
+
+    private static func kcpCommandName(_ cmd: UInt8) -> String {
+        switch cmd {
+        case 81: return "PUSH"
+        case 82: return "ACK"
+        case 83: return "WASK"
+        case 84: return "WINS"
+        default: return "UNKNOWN"
+        }
+    }
+
+    private static func parseSmuxSummary(_ data: Data) -> String? {
+        guard data.count >= 8 else { return nil }
+        let version = data[0]
+        let command = data[1]
+        let length = data.loadUInt16LE(at: 2)
+        let streamID = data.loadUInt32LE(at: 4)
+        let commandName: String
+        switch command {
+        case 0: commandName = "SYN"
+        case 1: commandName = "FIN"
+        case 2: commandName = "PSH"
+        case 3: commandName = "NOP"
+        case 4: commandName = "UPD"
+        default: commandName = "UNKNOWN"
+        }
+        return "smux[v=\(version) cmd=\(commandName)(\(command)) sid=\(streamID) len=\(length)]"
+    }
+}
+
+private struct ParsedKcpSegment {
+    let conv: UInt32
+    let cmd: UInt8
+    let frg: UInt8
+    let wnd: UInt16
+    let ts: UInt32
+    let sn: UInt32
+    let una: UInt32
+    let length: UInt32
+    let payload: Data
+}
+
+private extension Data {
+    func loadUInt16LE(at offset: Int) -> UInt16 {
+        withUnsafeBytes { rawBuffer in
+            rawBuffer.loadUnaligned(fromByteOffset: offset, as: UInt16.self)
+        }.littleEndian
+    }
+
+    func loadUInt32LE(at offset: Int) -> UInt32 {
+        withUnsafeBytes { rawBuffer in
+            rawBuffer.loadUnaligned(fromByteOffset: offset, as: UInt32.self)
+        }.littleEndian
     }
 }
 
