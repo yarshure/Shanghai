@@ -4,6 +4,12 @@ import Shanghai
 
 private enum ProxyError: Error {
     case invalidRequest
+    case noRoute
+}
+
+private enum ProxyRequestKind {
+    case connect
+    case forward
 }
 
 private final class SessionIDAllocator: @unchecked Sendable {
@@ -59,20 +65,31 @@ private final class ProxyRuntime: NSObject, KcpTunStreamHandler, @unchecked Send
     private let connector: KcpTunConnector
     private let context: ProxyContext
     private let owner: LocalConnectProxy
+    private let requestKind: ProxyRequestKind
     private let queue = DispatchQueue(label: "shanghai.proxy.runtime")
     private var handshakeBuffer = Data()
     private var responseForwardingStarted = false
 
-    init(sessionID: UInt32, connector: KcpTunConnector, context: ProxyContext, owner: LocalConnectProxy) {
+    init(
+        sessionID: UInt32,
+        connector: KcpTunConnector,
+        context: ProxyContext,
+        owner: LocalConnectProxy,
+        requestKind: ProxyRequestKind
+    ) {
         self.sessionID = sessionID
         self.connector = connector
         self.context = context
         self.owner = owner
+        self.requestKind = requestKind
     }
 
     func start(with connectRequest: Data) {
         connector.openStream(self)
         connector.send(connectRequest, for: sessionID)
+        if requestKind == .forward {
+            _ = context.markEstablished()
+        }
         readClientTunnelBytes()
     }
 
@@ -97,7 +114,9 @@ private final class ProxyRuntime: NSObject, KcpTunStreamHandler, @unchecked Send
             self.handshakeBuffer.removeAll(keepingCapacity: false)
             self.responseForwardingStarted = true
 
-            if headerText.contains("200 Connection established") || headerText.contains("200 Connection Established") {
+            if self.requestKind == .forward {
+                _ = self.context.markEstablished()
+            } else if headerText.contains("200 Connection established") || headerText.contains("200 Connection Established") {
                 let buffered = self.context.markEstablished()
                 for chunk in buffered {
                     self.connector.send(chunk, for: self.sessionID)
@@ -146,19 +165,28 @@ private final class ProxyRuntime: NSObject, KcpTunStreamHandler, @unchecked Send
 
 private final class LocalConnectProxy: @unchecked Sendable {
     private let listener: NWListener
-    private let connector: KcpTunConnector
+    private let manager: KcpTunConnectorManager
+    private let routeTable: KcpProxyRouteTable
+    private let connectorCallbackQueue: DispatchQueue
     private let sidAllocator = SessionIDAllocator()
     private let queue = DispatchQueue(label: "shanghai.proxy.listener")
     private let runtimeQueue = DispatchQueue(label: "shanghai.proxy.runtime.map")
+    private let runtimeRegistry = KcpProxyRuntimeRegistry()
     private var runtimes: [UInt32: ProxyRuntime] = [:]
 
-    init(listenPort: UInt16, connector: KcpTunConnector) throws {
-        self.connector = connector
+    init(
+        listenPort: UInt16,
+        manager: KcpTunConnectorManager,
+        routeTable: KcpProxyRouteTable,
+        connectorCallbackQueue: DispatchQueue
+    ) throws {
+        self.manager = manager
+        self.routeTable = routeTable
+        self.connectorCallbackQueue = connectorCallbackQueue
         self.listener = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: listenPort)!)
     }
 
     func start() throws {
-        try connector.start()
         listener.newConnectionHandler = { [weak self] connection in
             self?.handle(connection: connection)
         }
@@ -179,6 +207,8 @@ private final class LocalConnectProxy: @unchecked Sendable {
     func removeRuntime(sessionID: UInt32) {
         runtimeQueue.async {
             self.runtimes.removeValue(forKey: sessionID)
+            self.runtimeRegistry.remove(sessionID)
+            print("ShanghaiProxy runtime removed sid=\(sessionID) active=\(self.runtimeRegistry.count)")
         }
     }
 
@@ -200,12 +230,25 @@ private final class LocalConnectProxy: @unchecked Sendable {
             if let range = buffer.range(of: marker) {
                 let requestData = Data(buffer[..<range.upperBound])
                 do {
-                    try self.validateConnectRequest(requestData)
+                    let requestKind = try self.validateProxyRequest(requestData)
+                    guard let selection = self.routeTable.selectTarget(for: requestData) else {
+                        throw ProxyError.noRoute
+                    }
+                    let connector = self.makeConnector(for: selection.upstream)
+                    try connector.start()
                     let sessionID = self.sidAllocator.next()
                     let context = ProxyContext(connection: connection, sessionID: sessionID)
-                    let runtime = ProxyRuntime(sessionID: sessionID, connector: self.connector, context: context, owner: self)
+                    let runtime = ProxyRuntime(
+                        sessionID: sessionID,
+                        connector: connector,
+                        context: context,
+                        owner: self,
+                        requestKind: requestKind
+                    )
                     self.runtimeQueue.async {
                         self.runtimes[sessionID] = runtime
+                        self.runtimeRegistry.insert(sessionID)
+                        print("ShanghaiProxy runtime added sid=\(sessionID) route=\(selection.route?.name ?? "default") endpoint=\(selection.upstream.endpoint) active=\(self.runtimeRegistry.count)")
                     }
                     runtime.start(with: requestData)
                 } catch {
@@ -225,10 +268,56 @@ private final class LocalConnectProxy: @unchecked Sendable {
         }
     }
 
-    private func validateConnectRequest(_ data: Data) throws {
+    private func validateProxyRequest(_ data: Data) throws -> ProxyRequestKind {
         let text = String(decoding: data, as: UTF8.self)
-        guard text.hasPrefix("CONNECT ") else {
+        if text.hasPrefix("CONNECT ") {
+            return .connect
+        }
+        if text.hasPrefix("GET http://") || text.hasPrefix("POST http://") || text.hasPrefix("HEAD http://") {
+            return .forward
+        }
+        if text.hasPrefix("GET https://") || text.hasPrefix("POST https://") || text.hasPrefix("HEAD https://") {
+            return .forward
+        }
+        if text.hasPrefix("PUT http://") || text.hasPrefix("DELETE http://") || text.hasPrefix("OPTIONS http://") {
+            return .forward
+        }
+        if text.hasPrefix("PUT https://") || text.hasPrefix("DELETE https://") || text.hasPrefix("OPTIONS https://") {
+            return .forward
+        }
+        if text.hasPrefix("PATCH http://") || text.hasPrefix("PATCH https://") {
+            return .forward
+        }
+        guard text.contains(" HTTP/1.") else {
             throw ProxyError.invalidRequest
+        }
+        return .forward
+    }
+
+    private func makeConnector(for upstream: KcpProxyUpstreamConfiguration) -> KcpTunConnector {
+        manager.connector(for: upstream.endpoint, callbackQueue: connectorCallbackQueue) { endpoint in
+            KcpTunConnectorConfiguration(
+                endpoint: endpoint,
+                kcp: KcpConfiguration(
+                    conversationID: 1,
+                    mtu: 1_350,
+                    sendWindow: 128,
+                    receiveWindow: 512,
+                    noDelay: 0,
+                    interval: 30,
+                    resend: 2,
+                    disableCongestionControl: 1,
+                    streamMode: true,
+                    preSharedKey: upstream.password,
+                    crypt: upstream.crypt
+                ),
+                smuxVersion: upstream.smuxVersion,
+                keepAliveInterval: 10,
+                maxFrameSize: 8_192,
+                maxStreamBuffer: 2_097_152,
+                compressionEnabled: upstream.compressionEnabled,
+                bootstrapSessionID: 0
+            )
         }
     }
 }
@@ -241,57 +330,69 @@ private func envUInt16(_ key: String, default value: UInt16) -> UInt16 {
     UInt16(env(key, default: String(value))) ?? value
 }
 
+private func parseCrypt(_ raw: String) -> KcpPacketCryptoMethod {
+    switch raw.lowercased() {
+    case "aes":
+        return .aes
+    case "aes-128":
+        return .aes128
+    case "aes-192":
+        return .aes192
+    default:
+        return .none
+    }
+}
+
+private func parseSmuxVersion(_ raw: String) -> KcpSmuxVersion {
+    raw == "1" ? .v1 : .v2
+}
+
+private func parseRouteTable() -> KcpProxyRouteTable {
+    let defaultUpstream = KcpProxyUpstreamConfiguration(
+        endpoint: KcpRemoteEndpoint(host: remoteHost, port: remotePort),
+        smuxVersion: parseSmuxVersion(env("SHANGHAI_KCPTUN_SMUXVER", default: "2")),
+        crypt: parseCrypt(env("SHANGHAI_KCPTUN_CRYPT", default: "none")),
+        compressionEnabled: env("SHANGHAI_KCPTUN_NOCOMP", default: "1") != "1",
+        password: env("SHANGHAI_KCPTUN_PASSWORD", default: "Xifeng2026")
+    )
+
+    let rawRoutes = env("SHANGHAI_PROXY_ROUTE_TABLE", default: "")
+        .split(separator: ";", omittingEmptySubsequences: true)
+
+    let routes = rawRoutes.compactMap { item -> KcpProxyRoute? in
+        let fields = item.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+        guard fields.count >= 8, let port = UInt16(fields[3]) else { return nil }
+        let hosts = fields[1].split(separator: ",", omittingEmptySubsequences: true).map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let upstream = KcpProxyUpstreamConfiguration(
+            endpoint: KcpRemoteEndpoint(host: fields[2], port: port),
+            smuxVersion: parseSmuxVersion(fields[4]),
+            crypt: parseCrypt(fields[5]),
+            compressionEnabled: fields[6] != "1",
+            password: fields[7]
+        )
+        return KcpProxyRoute(name: fields[0], hostPatterns: hosts, upstream: upstream)
+    }
+
+    return KcpProxyRouteTable(routes: routes, defaultUpstream: defaultUpstream)
+}
+
 let remoteHost = env("SHANGHAI_KCPTUN_HOST", default: "127.0.0.1")
 let remotePort = envUInt16("SHANGHAI_KCPTUN_PORT", default: 63201)
 let listenPort = envUInt16("SHANGHAI_LOCAL_PROXY_PORT", default: 13059)
-let password = env("SHANGHAI_KCPTUN_PASSWORD", default: "Xifeng2026")
-let smuxVersion = env("SHANGHAI_KCPTUN_SMUXVER", default: "2") == "1" ? KcpSmuxVersion.v1 : .v2
-let cryptString = env("SHANGHAI_KCPTUN_CRYPT", default: "none")
-let crypt: KcpPacketCryptoMethod
-switch cryptString {
-case "aes":
-    crypt = .aes
-case "aes-128":
-    crypt = .aes128
-case "aes-192":
-    crypt = .aes192
-default:
-    crypt = .none
-}
-let compressed = env("SHANGHAI_KCPTUN_NOCOMP", default: "1") != "1"
 
 let manager = KcpTunConnectorManager()
 let connectorCallbackQueue = DispatchQueue(label: "shanghai.proxy.connector.callback")
-let connector = manager.connector(
-    for: KcpRemoteEndpoint(host: remoteHost, port: remotePort),
-    callbackQueue: connectorCallbackQueue
-) { endpoint in
-    KcpTunConnectorConfiguration(
-        endpoint: endpoint,
-        kcp: KcpConfiguration(
-            conversationID: 1,
-            mtu: 1_350,
-            sendWindow: 128,
-            receiveWindow: 512,
-            noDelay: 0,
-            interval: 30,
-            resend: 2,
-            disableCongestionControl: 1,
-            streamMode: true,
-            preSharedKey: password,
-            crypt: crypt
-        ),
-        smuxVersion: smuxVersion,
-        keepAliveInterval: 10,
-        maxFrameSize: 8_192,
-        maxStreamBuffer: 2_097_152,
-        compressionEnabled: compressed,
-        bootstrapSessionID: 0
-    )
-}
+let routeTable = parseRouteTable()
 
 do {
-    let proxy = try LocalConnectProxy(listenPort: listenPort, connector: connector)
+    let proxy = try LocalConnectProxy(
+        listenPort: listenPort,
+        manager: manager,
+        routeTable: routeTable,
+        connectorCallbackQueue: connectorCallbackQueue
+    )
     try proxy.start()
     dispatchMain()
 } catch {
