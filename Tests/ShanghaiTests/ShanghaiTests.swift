@@ -316,6 +316,43 @@ private func runHTTPProbe(profile: LocalKcptunCase) async throws {
     #expect(connectorA === connectorB)
 }
 
+@Test func proxyRouteTableMatchesHTTPAndHTTPSHosts() async throws {
+    let upstream = KcpProxyUpstreamConfiguration(
+        endpoint: KcpRemoteEndpoint(host: "192.168.11.35", port: 63201),
+        smuxVersion: .v2,
+        crypt: .none,
+        compressionEnabled: false,
+        password: "Xifeng2026"
+    )
+    let table = KcpProxyRouteTable(
+        routes: [
+            KcpProxyRoute(name: "proxy1", hostPatterns: ["www.x.com"], upstream: upstream),
+            KcpProxyRoute(name: "proxy2", hostPatterns: ["ifconfig.co"], upstream: upstream),
+            KcpProxyRoute(name: "proxy3", hostPatterns: ["www.google.com"], upstream: upstream),
+        ],
+        defaultUpstream: upstream
+    )
+
+    let httpX = Data("GET http://www.x.com/ HTTP/1.1\r\nHost: www.x.com\r\n\r\n".utf8)
+    let httpsIfconfig = Data("CONNECT ifconfig.co:443 HTTP/1.1\r\nHost: ifconfig.co:443\r\n\r\n".utf8)
+    let httpGoogle = Data("GET http://www.google.com/ HTTP/1.1\r\nHost: www.google.com\r\n\r\n".utf8)
+
+    #expect(table.selectTarget(for: httpX)?.route?.name == "proxy1")
+    #expect(table.selectTarget(for: httpsIfconfig)?.route?.name == "proxy2")
+    #expect(table.selectTarget(for: httpGoogle)?.route?.name == "proxy3")
+}
+
+@Test func proxyRuntimeRegistryReleasesSessions() async throws {
+    let registry = KcpProxyRuntimeRegistry()
+    registry.insert(3)
+    registry.insert(5)
+    #expect(registry.count == 2)
+    registry.remove(3)
+    #expect(registry.count == 1)
+    registry.remove(5)
+    #expect(registry.count == 0)
+}
+
 @Test(
     "Local KCPTUN case",
     .enabled(if: LocalKcptunTestConfig.shouldRunCurrentCase(), "Set SHANGHAI_RUN_LOCAL_KCPTUN_CASE=1 and SHANGHAI_KCPTUN_PORT to run a local kcptun integration case."),
