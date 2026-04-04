@@ -261,7 +261,11 @@ default:
 let compressed = env("SHANGHAI_KCPTUN_NOCOMP", default: "1") != "1"
 
 let manager = KcpTunConnectorManager()
-let connector = manager.connector(for: KcpRemoteEndpoint(host: remoteHost, port: remotePort)) { endpoint in
+let connectorCallbackQueue = DispatchQueue(label: "shanghai.proxy.connector.callback")
+let connector = manager.connector(
+    for: KcpRemoteEndpoint(host: remoteHost, port: remotePort),
+    callbackQueue: connectorCallbackQueue
+) { endpoint in
     KcpTunConnectorConfiguration(
         endpoint: endpoint,
         kcp: KcpConfiguration(

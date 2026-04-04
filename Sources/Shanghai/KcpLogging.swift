@@ -9,23 +9,30 @@ enum KcpLogLevel: String {
 }
 
 enum KcpLog {
+    private static let minimumLevel = configuredMinimumLevel()
+
     static func trace(_ message: @autoclosure () -> String) {
+        guard shouldLog(.trace) else { return }
         write(.trace, message())
     }
 
     static func info(_ message: @autoclosure () -> String) {
+        guard shouldLog(.info) else { return }
         write(.info, message())
     }
 
     static func warning(_ message: @autoclosure () -> String) {
+        guard shouldLog(.warning) else { return }
         write(.warning, message())
     }
 
     static func error(_ message: @autoclosure () -> String) {
+        guard shouldLog(.error) else { return }
         write(.error, message())
     }
 
     static func hexDump(_ label: String, data: Data, limit: Int = 512) {
+        guard shouldLog(.trace) else { return }
         let clipped = data.prefix(limit)
         let hex = clipped.enumerated().map { index, byte in
             let prefix = index.isMultiple(of: 16) ? String(format: "\n%04x: ", index) : ""
@@ -36,8 +43,40 @@ enum KcpLog {
     }
 
     private static func write(_ level: KcpLogLevel, _ message: String) {
-        let formatter = ISO8601DateFormatter()
-        let timestamp = formatter.string(from: Date())
+        let timestamp = String(format: "%.3f", Date().timeIntervalSince1970)
         print("[\(timestamp)] [\(level.rawValue)] [Shanghai.KCP] \(message)")
+    }
+
+    private static func configuredMinimumLevel() -> KcpLogLevel {
+        let raw = ProcessInfo.processInfo.environment["SHANGHAI_LOG_LEVEL"]?.lowercased()
+        switch raw {
+        case "trace":
+            return .trace
+        case "warning", "warn":
+            return .warning
+        case "error":
+            return .error
+        case "info", nil:
+            return .info
+        default:
+            return .info
+        }
+    }
+
+    private static func shouldLog(_ level: KcpLogLevel) -> Bool {
+        priority(of: level) >= priority(of: minimumLevel)
+    }
+
+    private static func priority(of level: KcpLogLevel) -> Int {
+        switch level {
+        case .trace:
+            return 0
+        case .info:
+            return 1
+        case .warning:
+            return 2
+        case .error:
+            return 3
+        }
     }
 }

@@ -11,6 +11,7 @@ public final class KcpTunConnectorManager: @unchecked Sendable {
 
     public func connector(
         for endpoint: KcpRemoteEndpoint,
+        callbackQueue: DispatchQueue = .main,
         makeConfiguration: @escaping @Sendable (KcpRemoteEndpoint) -> KcpTunConnectorConfiguration
     ) -> KcpTunConnector {
         queue.sync {
@@ -20,7 +21,7 @@ public final class KcpTunConnectorManager: @unchecked Sendable {
             }
 
             KcpLog.info("create connector endpoint=\(endpoint)")
-            let connector = KcpTunConnector(configuration: makeConfiguration(endpoint))
+            let connector = KcpTunConnector(configuration: makeConfiguration(endpoint), callbackQueue: callbackQueue)
             connector.onStateChange = { [weak self] connector, connected in
                 guard !connected else { return }
                 self?.queue.async { [weak self] in
