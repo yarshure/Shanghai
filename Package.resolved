@@ -1,13 +1,13 @@
 {
-  "originHash" : "82a73e3e1b2e4d5c343b5f3158b91cadd0e726584cf3bd4171f22bddade187e1",
+  "originHash" : "95d968c3222a9d203320320c17516b4ff25a3fa1bce6e82c4e682934b678d2c2",
   "pins" : [
     {
       "identity" : "liso",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/yarshure/Liso",
       "state" : {
-        "branch" : "main",
-        "revision" : "cb1eb10fc325e4cd80782bce8c61cedfc0329ffc"
+        "revision" : "f5717f4c35b629673d391603a0ec5ebd50dda843",
+        "version" : "0.0.1"
       }
     },
     {
