@@ -25,7 +25,7 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(url: "https://github.com/yarshure/Liso", from: "0.0.1"),
+        .package(url: "https://github.com/yarshure/Liso", branch: "codex/buffered-logger"),
         .package(url: "https://github.com/jedisct1/swift-sodium.git", from: "0.9.1"),
         .package(url: "https://github.com/awxkee/snappy.swift", from: "1.0.0"),
     ],
