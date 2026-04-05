@@ -654,7 +654,7 @@ static void ikcp_ack_push(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 		}
 
 		kcp->acklist = acklist;
-		kcp->ackblock = newblock;
+		kcp->ackblock = (IINT32)newblock;
 	}
 
 	ptr = &kcp->acklist[kcp->ackcount * 2];
@@ -784,7 +784,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 
 		if (cmd == IKCP_CMD_ACK) {
 			if (_itimediff(kcp->current, ts) >= 0) {
-				ikcp_update_ack(kcp, _itimediff(kcp->current, ts));
+				ikcp_update_ack(kcp,  (IINT32)_itimediff(kcp->current, ts));
 			}
 			ikcp_parse_ack(kcp, sn);
 			ikcp_shrink_buf(kcp);
@@ -1131,7 +1131,7 @@ void ikcp_update(ikcpcb *kcp, IUINT32 current)
 		kcp->ts_flush = kcp->current;
 	}
 
-	slap = _itimediff(kcp->current, kcp->ts_flush);
+	slap = (IINT32)_itimediff(kcp->current, kcp->ts_flush);
 
 	if (slap >= 10000 || slap < -10000) {
 		kcp->ts_flush = kcp->current;
@@ -1178,11 +1178,11 @@ IUINT32 ikcp_check(const ikcpcb *kcp, IUINT32 current)
 		return current;
 	}
 
-	tm_flush = _itimediff(ts_flush, current);
+	tm_flush = (IINT32)_itimediff(ts_flush, current);
 
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = p->next) {
 		const IKCPSEG *seg = iqueue_entry(p, const IKCPSEG, node);
-		IINT32 diff = _itimediff(seg->resendts, current);
+		IINT32 diff = (IINT32)_itimediff(seg->resendts, current);
 		if (diff <= 0) {
 			return current;
 		}

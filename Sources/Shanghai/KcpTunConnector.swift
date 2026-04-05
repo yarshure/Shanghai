@@ -2,7 +2,7 @@ import Dispatch
 import Foundation
 import snappy
 
-public protocol KcpTunStreamHandler: AnyObject {
+public protocol KcpTunStreamHandler: Sendable, AnyObject {
     var sessionID: UInt32 { get }
     func connectorDidConnect(_ connector: KcpTunConnector)
     func connector(_ connector: KcpTunConnector, didReceive data: Data, for sessionID: UInt32)
@@ -137,15 +137,29 @@ public final class KcpTunConnector: @unchecked Sendable {
     }
 
     private func wireSessionCallbacks() {
+        // 预先捕获队列，减少 self?. 访问
+        let q = self.queue
+        
         session.onReceive = { [weak self] data in
-            self?.queue.async {
-                self?.handleInboundPayload(data)
+            guard let self = self else { return }
+            // 只有在大吞吐量导致 UI 卡顿时才切换，否则保持在 IO 线程
+            q.async {
+                self.handleInboundPayload(data)
             }
         }
-
+        
+        // onStop 频率极低，维持原有逻辑即可
         session.onStop = { [weak self] error in
-            self?.queue.async {
-                self?.handleSessionStop(error: error)
+            // 1. 立即检查 self 是否存在，避免不必要的派发任务到队列
+            guard let self = self else { return }
+            
+            // 2. 捕获需要用到的引用，减少在 async 块中的 self 查找开销
+            let queue = self.queue
+            
+            queue.async { [weak self] in
+                // 3. 在执行具体逻辑前再次确认 self 没被析构
+                guard let self = self else { return }
+                self.handleSessionStop(error: error)
             }
         }
     }

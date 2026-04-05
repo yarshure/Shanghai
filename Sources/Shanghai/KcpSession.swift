@@ -445,31 +445,68 @@ public final class KcpSession: @unchecked Sendable {
 
     private static func describeLocalEndpoint(_ fd: Int32) -> String? {
         var storage = sockaddr_storage()
-        var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
-        let result = withUnsafeMutablePointer(to: &storage) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
-                getsockname(fd, sockaddrPointer, &length)
+//        var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+//        let result = withUnsafeMutablePointer(to: &storage) { pointer in
+//            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+//                getsockname(fd, sockaddrPointer, &length)
+//            }
+//        }
+//        guard result == 0 else { return nil }
+//        // 假设 storage 是 sockaddr_storage，length 是该地址的实际长度
+//        var hostBuffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+//        var serviceBuffer = [CChar](repeating: 0, count: Int(NI_MAXSERV))
+//        let nameInfo = withUnsafePointer(to: &storage) { pointer in
+//            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+//                getnameinfo(
+//                    sockaddrPointer,
+//                    socklen_t(length), // 确保转为 socklen_t,
+//                    &hostBuffer,
+//                    socklen_t(hostBuffer.count),
+//                    &serviceBuffer,
+//                    socklen_t(serviceBuffer.count),
+//                    NI_NUMERICHOST | NI_NUMERICSERV
+//                )
+//            }
+//        }
+//
+//        guard nameInfo == 0 else { return nil }
+//
+//        // 转换为 Swift String
+//        let host =   String(cString: hostBuffer)
+//        let service = String(cString: serviceBuffer)
+//        return "\(host):\(service)"
+        
+        // 针对 IPv4 的极致快速路径 (无需 getnameinfo)
+        if storage.ss_family == sa_family_t(AF_INET) {
+            // IPv4 保持不变
+            return withUnsafePointer(to: &storage) { ptr in
+                ptr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
+                    let addr = sin.pointee.sin_addr.s_addr
+                    let p = sin.pointee.sin_port.byteSwapped
+                    return "\(Int(addr & 0xFF)).\(Int((addr >> 8) & 0xFF)).\(Int((addr >> 16) & 0xFF)).\(Int((addr >> 24) & 0xFF)):\(p)"
+                }
+            }
+        } else if storage.ss_family == sa_family_t(AF_INET6) {
+            // IPv6 高性能手动解析
+            return withUnsafePointer(to: &storage) { ptr in
+                ptr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { sin6 in
+                    let addr = sin6.pointee.sin6_addr.__u6_addr.__u6_addr16
+                    let p = sin6.pointee.sin6_port.byteSwapped
+                    
+                    // 提取 8 个 16 位片段（注意字节序转换）
+                    let segments = [
+                        addr.0.byteSwapped, addr.1.byteSwapped, addr.2.byteSwapped, addr.3.byteSwapped,
+                        addr.4.byteSwapped, addr.5.byteSwapped, addr.6.byteSwapped, addr.7.byteSwapped
+                    ]
+                    
+                    // 格式化为标准 IPv6 字符串 [addr]:port
+                    let ipStr = segments.map { String(format: "%x", $0) }.joined(separator: ":")
+                    return "[\(ipStr)]:\(p)"
+                }
             }
         }
-        guard result == 0 else { return nil }
-
-        var hostBuffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-        var serviceBuffer = [CChar](repeating: 0, count: Int(NI_MAXSERV))
-        let nameInfo = withUnsafePointer(to: &storage) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
-                getnameinfo(
-                    sockaddrPointer,
-                    length,
-                    &hostBuffer,
-                    socklen_t(hostBuffer.count),
-                    &serviceBuffer,
-                    socklen_t(serviceBuffer.count),
-                    NI_NUMERICHOST | NI_NUMERICSERV
-                )
-            }
-        }
-        guard nameInfo == 0 else { return nil }
-        return "\(String(cString: hostBuffer)):\(String(cString: serviceBuffer))"
+        return ""
+        
     }
 
     private func logKcpSegments(_ label: String, data: Data) {

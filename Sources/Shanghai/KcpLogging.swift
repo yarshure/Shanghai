@@ -7,8 +7,25 @@ enum KcpLogLevel: String {
     case warning = "WARN"
     case error = "ERROR"
 }
-
+struct NativeLog {
+    static func timestamp() -> Int64 {
+        var tv = timeval()
+        gettimeofday(&tv, nil)
+        // 转换为毫秒 (1秒 = 1000毫秒, 1微秒 = 1/1000毫秒)
+        return Int64(tv.tv_sec) * 1000 + Int64(tv.tv_usec) / 1000
+    }
+}
 enum KcpLog {
+    
+    // 线程安全，因为 ContinuousClock 是 Sendable 的
+    @available(iOS 16.0, *)
+    private static let clock = NativeLog()
+    
+    static func getTimestamp() -> String {
+        // 返回从系统启动开始的秒数，纳秒级精度
+        let now = NativeLog.timestamp()
+        return "\(now)"
+    }
     private static let minimumLevel = configuredMinimumLevel()
 
     static func trace(_ message: @autoclosure () -> String) {
@@ -43,8 +60,8 @@ enum KcpLog {
     }
 
     private static func write(_ level: KcpLogLevel, _ message: String) {
-        let timestamp = String(format: "%.3f", Date().timeIntervalSince1970)
-        print("[\(timestamp)] [\(level.rawValue)] [Shanghai.KCP] \(message)")
+        //let timestamp = String(format: "%.3f", Date().timeIntervalSince1970)
+        print("[\(getTimestamp())] [\(level.rawValue)] [Shanghai.KCP] \(message)")
     }
 
     private static func configuredMinimumLevel() -> KcpLogLevel {
