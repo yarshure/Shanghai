@@ -92,9 +92,22 @@ public final class KcpSession: @unchecked Sendable {
     }
 
     deinit {
-        stateQueue.sync {
-            shutdown(nil, notify: false)
-        }
+        // Cannot dispatch_sync to stateQueue from deinit — deinit
+        // can fire from a closure already executing ON stateQueue
+        // (e.g. send()'s `stateQueue.async { [weak self] in guard
+        // let self … }` upgrades to a strong ref for the body, and
+        // when the last external strong ref has been dropped, the
+        // closure's tail-release IS the final release → deinit
+        // runs inline on stateQueue → sync from same queue
+        // deadlocks in __DISPATCH_WAIT_FOR_QUEUE__).
+        //
+        // Direct call is safe by ARC contract: at deinit-time no
+        // other thread holds a reference. All dispatch sources
+        // (readSource, updateTimer) captured `[weak self]` and
+        // would no-op via `self?`; any pending dispatched blocks
+        // that captured `[weak self]` will hit `guard let self`
+        // and fall through cleanly.
+        shutdown(nil, notify: false)
     }
 
     public func start() throws {
