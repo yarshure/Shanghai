@@ -15,6 +15,10 @@ private struct LocalKcptunCase: Sendable {
     let requestURL: String
     let requestHostHeader: String
     let expectedResponseMarker: String
+    /// FEC group sizing — must match the kcptun-server's
+    /// `--datashard / --parityshard` flags. 0/0 disables FEC.
+    let dataShards: Int
+    let parityShards: Int
 }
 
 private enum LocalKcptunTestConfig {
@@ -41,6 +45,8 @@ private enum LocalKcptunTestConfig {
         let requestURL = env["SHANGHAI_PROXY_REQUEST_URL"] ?? "http://example.com/"
         let requestHostHeader = env["SHANGHAI_PROXY_REQUEST_HOST"] ?? "example.com"
         let expectedResponseMarker = env["SHANGHAI_EXPECT_RESPONSE_MARKER"] ?? "HTTP/"
+        let dataShards = Int(env["SHANGHAI_KCPTUN_DATASHARD"] ?? "0") ?? 0
+        let parityShards = Int(env["SHANGHAI_KCPTUN_PARITYSHARD"] ?? "0") ?? 0
         let cryptMethod: KcpPacketCryptoMethod
         switch crypt {
         case "aes":
@@ -65,7 +71,9 @@ private enum LocalKcptunTestConfig {
             requestMethod: requestMethod,
             requestURL: requestURL,
             requestHostHeader: requestHostHeader,
-            expectedResponseMarker: expectedResponseMarker
+            expectedResponseMarker: expectedResponseMarker,
+            dataShards: dataShards,
+            parityShards: parityShards
         )
     }
 
@@ -199,7 +207,9 @@ private func makeConnector(
                 disableCongestionControl: 1,
                 streamMode: true,
                 preSharedKey: profile.password,
-                crypt: profile.crypt
+                crypt: profile.crypt,
+                dataShards: profile.dataShards,
+                parityShards: profile.parityShards
             ),
             smuxVersion: profile.smuxVersion,
             keepAliveInterval: 10,

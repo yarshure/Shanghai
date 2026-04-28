@@ -20,6 +20,13 @@ public struct KcpConfiguration: Sendable {
     public var streamMode: Bool
     public var preSharedKey: String
     public var crypt: KcpPacketCryptoMethod
+    /// Number of data shards per FEC group. 0 disables FEC framing
+    /// entirely (kcp UDP packets go directly to the packet codec).
+    /// Must match the kcptun-server's `--datashard` flag.
+    public var dataShards: Int
+    /// Number of parity shards per FEC group. 0 disables FEC.
+    /// Must match the kcptun-server's `--parityshard` flag.
+    public var parityShards: Int
 
     public init(
         conversationID: UInt32 = UInt32.random(in: 1...UInt32.max),
@@ -32,7 +39,9 @@ public struct KcpConfiguration: Sendable {
         disableCongestionControl: Int32 = 1,
         streamMode: Bool = true,
         preSharedKey: String = "it's a secrect",
-        crypt: KcpPacketCryptoMethod = .none
+        crypt: KcpPacketCryptoMethod = .none,
+        dataShards: Int = 0,
+        parityShards: Int = 0
     ) {
         self.conversationID = conversationID
         self.mtu = mtu
@@ -45,6 +54,8 @@ public struct KcpConfiguration: Sendable {
         self.streamMode = streamMode
         self.preSharedKey = preSharedKey
         self.crypt = crypt
+        self.dataShards = dataShards
+        self.parityShards = parityShards
     }
 }
 
@@ -76,6 +87,11 @@ public final class KcpSession: @unchecked Sendable {
     private var stopped = false
     private var receiveBuffer = [UInt8](repeating: 0, count: 65_535)
     private var packetCodec: KcpPacketCodec?
+    /// Outbound FEC encoder; nil when configuration.dataShards == 0
+    /// (kcptun-server started with `--datashard 0 --parityshard 0`).
+    private var fecEncoder: KcpFECEncoder?
+    /// Inbound FEC decoder. Lifecycle mirrors fecEncoder.
+    private var fecDecoder: KcpFECDecoder?
 
     private static let kcpOverhead = 24
 
@@ -140,6 +156,26 @@ public final class KcpSession: @unchecked Sendable {
             )
             rawKcp.pointee.stream = configuration.streamMode ? 1 : 0
             packetCodec = try? KcpPacketCodec(crypt: configuration.crypt, password: configuration.preSharedKey)
+
+            // Initialise FEC if the caller asked for it. Both
+            // shards must be > 0 to enable; either being 0 means
+            // FEC framing is disabled and KCP UDP datagrams flow
+            // straight through the packet codec.
+            if configuration.dataShards > 0 && configuration.parityShards > 0 {
+                do {
+                    fecEncoder = try KcpFECEncoder(
+                        dataShards: configuration.dataShards,
+                        parityShards: configuration.parityShards)
+                    fecDecoder = try KcpFECDecoder(
+                        dataShards: configuration.dataShards,
+                        parityShards: configuration.parityShards)
+                    KcpLog.info("FEC enabled datashard=\(configuration.dataShards) parityshard=\(configuration.parityShards) remote=\(remoteHost):\(remotePort)")
+                } catch {
+                    KcpLog.error("FEC init failed datashard=\(configuration.dataShards) parityshard=\(configuration.parityShards) error=\(error) — proceeding without FEC")
+                    fecEncoder = nil
+                    fecDecoder = nil
+                }
+            }
 
             installReadSource()
             installUpdateTimer()
@@ -226,13 +262,18 @@ public final class KcpSession: @unchecked Sendable {
                 KcpLog.hexDump("udp recv", data: packet)
                 do {
                     let payload = try decodePacket(packet)
-                    logKcpSegments("udp recv payload", data: payload)
-                    payload.withUnsafeBytes { bytes in
-                        guard let baseAddress = bytes.bindMemory(to: Int8.self).baseAddress else {
-                            return
+                    // FEC framing layer (when enabled). Each plaintext
+                    // packet is `[seqid|flag|...]` per kcptun-go's
+                    // wire format; the decoder surfaces immediate
+                    // KCP packets and any reconstructed ones.
+                    let kcpPackets = unframeFEC(payload)
+                    for kcp in kcpPackets {
+                        logKcpSegments("udp recv payload", data: kcp)
+                        kcp.withUnsafeBytes { bytes in
+                            guard let baseAddress = bytes.bindMemory(to: Int8.self).baseAddress else { return }
+                            let inputResult = ikcp_input(rawKcp, baseAddress, Int(bytes.count))
+                            KcpLog.trace("ikcp_input result=\(inputResult) payloadBytes=\(bytes.count) remote=\(remoteHost):\(remotePort)")
                         }
-                        let inputResult = ikcp_input(rawKcp, baseAddress, Int(bytes.count))
-                        KcpLog.trace("ikcp_input result=\(inputResult) payloadBytes=\(bytes.count) remote=\(remoteHost):\(remotePort)")
                     }
                     logKcpState("after input")
                     updateKcpNow()
@@ -326,27 +367,62 @@ public final class KcpSession: @unchecked Sendable {
 
     fileprivate func writeKcpPacket(_ buffer: UnsafePointer<Int8>, length: Int32) -> Int32 {
         guard socketDescriptor >= 0 else { return -1 }
-        let payload = Data(bytes: buffer, count: Int(length))
-        let data: Data
-        do {
-            data = try encodePacket(payload)
-        } catch {
-            KcpLog.error("udp packet encode failed remote=\(remoteHost):\(remotePort) error=\(error)")
-            return -1
+        let kcpPacket = Data(bytes: buffer, count: Int(length))
+
+        // FEC framing layer (when enabled). One KCP packet expands
+        // into 1 data frame plus optionally `parityShards` parity
+        // frames at every group boundary. Each frame is then routed
+        // through the packet codec (AES) before going on the wire.
+        let frames: [Data]
+        if let fecEncoder {
+            frames = fecEncoder.encode(kcpPacket: kcpPacket)
+        } else {
+            frames = [kcpPacket]
         }
-        KcpLog.hexDump("udp send", data: data)
-        if let plaintext = try? decodePacket(data) {
-            logKcpSegments("udp send payload", data: plaintext)
+
+        var totalSent: Int32 = 0
+        for frame in frames {
+            let data: Data
+            do {
+                data = try encodePacket(frame)
+            } catch {
+                KcpLog.error("udp packet encode failed remote=\(remoteHost):\(remotePort) error=\(error)")
+                return -1
+            }
+            KcpLog.hexDump("udp send", data: data)
+            let sent = data.withUnsafeBytes { bytes in
+                Darwin.send(socketDescriptor, bytes.baseAddress, data.count, 0)
+            }
+            if sent < 0 {
+                KcpLog.error("udp send failed errno=\(errno) remote=\(remoteHost):\(remotePort)")
+                return -1
+            }
+            KcpLog.trace("udp send bytes=\(sent) frame=\(frames.firstIndex(of: frame).map(String.init) ?? "?")/\(frames.count) remote=\(remoteHost):\(remotePort)")
+            // Only the data frame counts toward what KCP thinks it sent;
+            // parity frames are parallel UDP work, not KCP layer.
+            if totalSent == 0 { totalSent = Int32(sent) }
         }
-        let sent = data.withUnsafeBytes { bytes in
-            Darwin.send(socketDescriptor, bytes.baseAddress, data.count, 0)
+        return totalSent
+    }
+
+    /// Unwrap a plaintext UDP payload through the FEC framing layer
+    /// (when enabled). Without FEC the input passes through as a
+    /// single KCP packet. With FEC, each arriving frame is
+    /// `[seqid|flag|...]`; the decoder surfaces the inner KCP packet
+    /// from data frames and any reconstructed packets when a group
+    /// completes with missing data shards.
+    private func unframeFEC(_ payload: Data) -> [Data] {
+        guard let fecDecoder else { return [payload] }
+        var out: [Data] = []
+        for result in fecDecoder.decode(framedPacket: payload) {
+            switch result {
+            case .immediate(let kcp):
+                out.append(kcp)
+            case .recovered(let kcps):
+                out.append(contentsOf: kcps)
+            }
         }
-        if sent < 0 {
-            KcpLog.error("udp send failed errno=\(errno) remote=\(remoteHost):\(remotePort)")
-            return -1
-        }
-        KcpLog.trace("udp send bytes=\(sent) remote=\(remoteHost):\(remotePort)")
-        return Int32(sent)
+        return out
     }
 
     private func shutdown(_ error: Error?, notify: Bool) {
