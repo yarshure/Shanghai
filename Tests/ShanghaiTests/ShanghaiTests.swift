@@ -161,13 +161,24 @@ private func buildProxyRequest(for profile: LocalKcptunCase) -> Data {
         requestLineTarget = profile.requestURL
     }
 
-    return Data("""
-    \(profile.requestMethod) \(requestLineTarget) HTTP/1.1\r
-    Host: \(profile.requestHostHeader)\r
-    User-Agent: ShanghaiTests/1.0 (\(profile.name))\r
-    Proxy-Connection: Keep-Alive\r
-    \r
-    """.utf8)
+    // Build the request explicitly with `\r\n` separators. The
+    // earlier multiline-literal form ended with a stray `\r` (the
+    // `\n` right before `"""` is dropped by Swift), producing
+    // `Keep-Alive\r\n\r` — three of four CRLF-terminator bytes.
+    // python http.server's BaseHTTPRequestHandler kept waiting for
+    // the missing `\n` and never dispatched to do_GET, which is
+    // why every matrix case timed out at `didReceiveResponse`.
+    // The smux/KCP layers were always fine — only the test's
+    // payload was malformed.
+    let lines = [
+        "\(profile.requestMethod) \(requestLineTarget) HTTP/1.1",
+        "Host: \(profile.requestHostHeader)",
+        "User-Agent: ShanghaiTests/1.0 (\(profile.name))",
+        "Proxy-Connection: Keep-Alive",
+        "",
+        ""
+    ]
+    return Data(lines.joined(separator: "\r\n").utf8)
 }
 
 private func makeConnector(
