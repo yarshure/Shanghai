@@ -25,14 +25,33 @@ kernel wg, listen 1632                          kernel wg, listen 1632
 从客户端侧先 ping 一下）。已在 124.221.22.9 实测：真·WG（macOS wireguard-go
 客户端 ↔ 内核 WG hub）跨真实网络跑通，~12ms，0 丢包。
 
-## ⚠️ 已知 bug：FEC 在真实链路上损坏 WG 流量
+## FEC 状态：逻辑正确（之前"FEC bug"系误判）
 
-`--datashard N --parityshard M`（FEC）目前有 bug：在**有抖动的真实链路**上，即使
-没有实际丢包，也会丢掉 ~75% 的 WireGuard 包（WG 的 anti-replay + poly1305 认证
-对 FEC 产生的重复/乱序/损坏包敏感；纯 echo 流量能容忍所以早期没暴露；loopback 无
-抖动也没暴露）。**暂时用 `--datashard 0 --parityshard 0` 关掉 FEC**。怀疑点：
-FEC 分片按组定长 padding，变长包（WG 握手 148 / 数据变长 / keepalive 32）的长度
-还原有问题。FEC 是抗 QoS 丢包的关键，必须修；见 KcpFEC.swift / KcpReedSolomon.swift。
+> 更正：早期记录里说 FEC 在真实链路上损坏 WG 流量 —— **那是误判**，是被混淆变量
+> 污染的实验（切 FEC 时同时重启了两端 + 重置 WG 握手 + 撞上下面两个真实问题）。
+
+深入排查结论：
+- **FEC 编解码逻辑正确**。三个严格单元测试覆盖：变长包重排（无丢包）、单组丢包恢复、
+  多组变长+丢包+重排压力测试 —— 全部 0 损坏、0 丢可恢复包。见 KcpReedSolomonTests。
+- 受控实验（真实 ikcp + 注入丢包/重排的本地中继）里 **FEC 在重排下反而显著降低丢包**
+  （11% vs 关 FEC 的表象 75%），符合预期。
+
+真正找到并修掉的是下面这个 bug ↓
+
+## ⚠️ 已修：client 会话在 ICMP 错误上永久自杀
+
+连接型 UDP 的 client 在收到一次 `ECONNREFUSED`（server 端口短暂不在/重启的瞬间会回
+ICMP port-unreachable）就**永久 shutdown 不重连**。生产里 server 一抖动/重启，所有
+client 全死。已修：KcpSession 把 `ECONNREFUSED/ECONNRESET/EHOSTUNREACH/ENETUNREACH/
+EHOSTDOWN` 当作瞬态吞掉（KCP 自会重传，连通恢复即自愈）。**这极可能就是当初"FEC 失败"
+的真凶之一**（反复重启 server，client 们都 ECONNREFUSED 死了）。
+
+## 限制：KCP 有状态，单侧重启需两端重建
+
+KCP 像 TCP 是有状态连接：server 重启后是全新 KCP 状态（seq 从 0），client 仍在高
+seq，两边永久 desync，**ICMP 修复只保证进程不死、瞬态抖动自愈，但 server 真正重启后
+这条 KCP 会话仍需两端重建**（由 supervisor 重拉 client，或后续做 KCP 会话重协商）。
+部署时 server 端用 systemd 常驻、避免无谓重启；client 端也挂 supervisor。
 
 ## 构建（macOS 上交叉编译出 Linux 静态二进制）
 

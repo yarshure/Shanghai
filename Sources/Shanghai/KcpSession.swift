@@ -346,6 +346,21 @@ public final class KcpSession: @unchecked Sendable {
                 break
             }
 
+            // ICMP-derived async errors on a CONNECTED UDP socket are
+            // TRANSIENT, not session-fatal: ECONNREFUSED = the peer's port
+            // wasn't open *for one datagram* (server restarting / not up
+            // yet), ECONNRESET / EHOSTUNREACH / ENETUNREACH / EHOSTDOWN =
+            // transient routing or ICMP rate-limiting. Killing the session
+            // here means a single server blip permanently drops every
+            // client (observed: a client died on errno 61 the instant the
+            // server bounced and never came back). Swallow it — KCP keeps
+            // retransmitting and the link self-heals when the peer returns.
+            if errno == ECONNREFUSED || errno == ECONNRESET
+                || errno == EHOSTUNREACH || errno == ENETUNREACH || errno == EHOSTDOWN {
+                KcpLog.trace("socket transient errno=\(errno) (ignored) remote=\(remoteHost):\(remotePort)")
+                break
+            }
+
             KcpLog.error("socket recv error errno=\(errno) remote=\(remoteHost):\(remotePort)")
             shutdown(KcpSessionError.socketConfigurationFailed(code: errno), notify: true)
             return
