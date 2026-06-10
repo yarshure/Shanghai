@@ -4,6 +4,8 @@ import Darwin
 import Glibc
 #elseif canImport(Musl)
 import Musl
+#elseif canImport(Android)
+import Android
 #endif
 
 // Module-qualified references resolved once, so the methods below (whose
@@ -23,6 +25,11 @@ private let libcRecv = Musl.recv
 private let libcSend = Musl.send
 private let libcRecvfrom = Musl.recvfrom
 private let libcSendto = Musl.sendto
+#elseif canImport(Android)
+private let libcRecv = Android.recv
+private let libcSend = Android.send
+private let libcRecvfrom = Android.recvfrom
+private let libcSendto = Android.sendto
 #endif
 
 /// Thin libc socket shim so the rest of the package never spells out
@@ -43,7 +50,13 @@ enum Posix {
 
     @inline(__always)
     static func send(_ fd: Int32, _ buffer: UnsafeRawPointer?, _ length: Int, _ flags: Int32) -> Int {
-        libcSend(fd, buffer, length, flags)
+#if canImport(Android)
+        // bionic types the buffer as `_Nonnull`; nothing useful to send if nil.
+        guard let buffer else { return 0 }
+        return libcSend(fd, buffer, length, flags)
+#else
+        return libcSend(fd, buffer, length, flags)
+#endif
     }
 
     @inline(__always)
@@ -67,7 +80,12 @@ enum Posix {
         _ address: UnsafePointer<sockaddr>?,
         _ addressLength: socklen_t
     ) -> Int {
-        libcSendto(fd, buffer, length, flags, address, addressLength)
+#if canImport(Android)
+        guard let buffer else { return 0 }
+        return libcSendto(fd, buffer, length, flags, address, addressLength)
+#else
+        return libcSendto(fd, buffer, length, flags, address, addressLength)
+#endif
     }
 
     static var socketTypeDatagram: Int32 {

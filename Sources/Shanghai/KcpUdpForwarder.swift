@@ -7,6 +7,8 @@ import Darwin
 import Glibc
 #elseif canImport(Musl)
 import Musl
+#elseif canImport(Android)
+import Android
 #endif
 
 /// KcpUdpForwarder — carry a UDP datagram protocol (e.g. WireGuard) over KCP,

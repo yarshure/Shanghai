@@ -9,6 +9,8 @@ import Darwin
 import Glibc
 #elseif canImport(Musl)
 import Musl
+#elseif canImport(Android)
+import Android
 #endif
 
 /// End-to-end loopback of the hub-to-hub topology: two symmetric

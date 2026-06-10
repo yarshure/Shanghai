@@ -25,6 +25,8 @@ import Darwin
 import Glibc
 #elseif canImport(Musl)
 import Musl
+#elseif canImport(Android)
+import Android
 #endif
 
 struct CLIError: Error, CustomStringConvertible {
