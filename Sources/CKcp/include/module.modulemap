@@ -11,7 +11,8 @@
 // because they live in the same directory; they just don't form
 // part of the public Swift module surface.
 module CKcp {
-    header "ikcp.h"     // KCP protocol C API used by KcpSession
-    header "kcp_rs.h"   // Reed-Solomon extern "C" wrapper
+    header "ikcp.h"           // KCP protocol C API used by KcpSession
+    header "kcp_rs.h"         // Reed-Solomon extern "C" wrapper
+    header "shanghai_crypt.h" // portable AES-CFB + PBKDF2-SHA1 (KcpPacketCodec)
     export *
 }

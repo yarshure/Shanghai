@@ -23,10 +23,20 @@ let package = Package(
             name: "ShanghaiProxy",
             targets: ["ShanghaiProxy"]
         ),
+        // Hub-side / sidecar UDP<->KCP forwarder. The only product a
+        // Linux hub needs: `swift build --product kcpfwd`. (ShanghaiProxy
+        // imports Network and stays Apple-only.)
+        .executable(
+            name: "kcpfwd",
+            targets: ["kcpfwd"]
+        ),
     ],
     dependencies: [
-        .package(url: "https://github.com/yarshure/Lisao", branch: "main"),
-        .package(url: "https://github.com/jedisct1/swift-sodium.git", from: "0.9.1"),
+        // NOTE: Lisao (was an unused import) and swift-sodium (only ever
+        // produced random nonce bytes, replaced by SystemRandomNumberGenerator)
+        // were dropped to keep the Linux build dependency-free. AES-CFB and
+        // PBKDF2-SHA1 live in CKcp/shanghai_crypt.c — libsodium provides
+        // neither, so it could not have covered the kcptun wire crypt anyway.
         .package(url: "https://github.com/awxkee/snappy.swift", from: "1.0.0"),
     ],
     targets: [
@@ -38,13 +48,21 @@ let package = Package(
             name: "Shanghai",
             dependencies: [
                 "CKcp",
-                .product(name: "Lisao", package: "Lisao"),
-                .product(name: "snappy", package: "snappy.swift"),
-                .product(name: "Sodium", package: "swift-sodium"),
+                // snappy.swift wraps an xcframework — Apple platforms only.
+                // KcpSnappyFramedCodec degrades to throwing stubs elsewhere.
+                .product(
+                    name: "snappy",
+                    package: "snappy.swift",
+                    condition: .when(platforms: [.macOS, .iOS, .macCatalyst, .tvOS, .watchOS, .visionOS])
+                ),
             ]
         ),
         .executableTarget(
             name: "ShanghaiProxy",
+            dependencies: ["Shanghai"]
+        ),
+        .executableTarget(
+            name: "kcpfwd",
             dependencies: ["Shanghai"]
         ),
         .testTarget(

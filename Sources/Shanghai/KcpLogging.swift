@@ -1,5 +1,12 @@
 import Foundation
-import Lisao
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 
 enum KcpLogLevel: String {
     case trace = "TRACE"

@@ -1,11 +1,19 @@
 import Foundation
+
+// snappy.swift ships as an xcframework (Apple-only binary) — it can never
+// build on Linux/FreeBSD. Compression is part of the smux/proxy stack only;
+// the WG-over-KCP forwarder path never touches it, so non-Apple platforms
+// compile these codecs as throwing stubs instead of losing the whole module.
+#if canImport(snappy)
 import snappy
+#endif
 
 enum KcpSnappyFramedCodecError: Error, Sendable {
     case invalidStreamIdentifier
     case invalidChunkLength
     case checksumMismatch
     case unsupportedChunkType(UInt8)
+    case compressionUnavailable
 }
 
 struct KcpSnappyFramedEncoder: Sendable {
@@ -40,6 +48,9 @@ struct KcpSnappyFramedEncoder: Sendable {
     }
 
     private func makeCompressedChunk(for payload: Data) throws -> Data {
+#if !canImport(snappy)
+        throw KcpSnappyFramedCodecError.compressionUnavailable
+#else
         let compressed = try snappy.compress(payload)
 
         var body = Data()
@@ -54,6 +65,7 @@ struct KcpSnappyFramedEncoder: Sendable {
         chunk.append(UInt8((body.count >> 16) & 0xff))
         chunk.append(body)
         return chunk
+#endif
     }
 
     private static func maskedCRC32C(_ data: Data) -> UInt32 {
@@ -107,12 +119,16 @@ struct KcpSnappyFramedDecoder: Sendable {
                 let expectedChecksum = body.withUnsafeBytes { rawBuffer in
                     rawBuffer.loadUnaligned(as: UInt32.self)
                 }
+#if !canImport(snappy)
+                throw KcpSnappyFramedCodecError.compressionUnavailable
+#else
                 let compressed = body.dropFirst(4)
                 let payload = try snappy.decompress(Data(compressed))
                 guard Self.maskedCRC32C(payload) == UInt32(littleEndian: expectedChecksum) else {
                     throw KcpSnappyFramedCodecError.checksumMismatch
                 }
                 decoded.append(payload)
+#endif
 
             case 0x01:
                 guard sawStreamIdentifier else {

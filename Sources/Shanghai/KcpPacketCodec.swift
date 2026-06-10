@@ -1,5 +1,5 @@
+import CKcp
 import Foundation
-import Sodium
 
 #if canImport(CommonCrypto)
 import CommonCrypto
@@ -65,7 +65,7 @@ struct KcpPacketCodec: Sendable {
             return packet
         }
 
-        return try cryptPacket(packet, operation: CCOperation(kCCEncrypt))
+        return try cryptPacket(packet, encrypt: true)
     }
 
     func decode(_ packet: Data) throws -> Data {
@@ -73,7 +73,7 @@ struct KcpPacketCodec: Sendable {
         if crypt == .none {
             plaintext = packet
         } else {
-            plaintext = try cryptPacket(packet, operation: CCOperation(kCCDecrypt))
+            plaintext = try cryptPacket(packet, encrypt: false)
         }
 
         guard plaintext.count >= Self.headerSize else {
@@ -93,12 +93,76 @@ struct KcpPacketCodec: Sendable {
         return Data(body)
     }
 
-    private func cryptPacket(_ packet: Data, operation: CCOperation) throws -> Data {
-#if canImport(CommonCrypto)
+    /// Apple builds use CommonCrypto (hardware AES, the path originally
+    /// validated against go kcptun); everything else uses the portable C
+    /// implementation in CKcp. KcpPacketCodecPortableTests cross-validates
+    /// the two byte-for-byte on macOS, which is what guarantees a Linux hub
+    /// and an Apple client agree on the wire.
+    private func cryptPacket(_ packet: Data, encrypt: Bool) throws -> Data {
         guard let key else {
             throw KcpPacketCodecError.keyDerivationFailed
         }
+#if canImport(CommonCrypto)
+        return try Self.commonCryptoCrypt(packet, key: key, encrypt: encrypt)
+#else
+        return try Self.portableCrypt(packet, key: key, encrypt: encrypt)
+#endif
+    }
 
+    /// AES-CFB via the dependency-free C implementation. Internal (not
+    /// private) so tests can cross-validate it against CommonCrypto.
+    static func portableCrypt(_ packet: Data, key: Data, encrypt: Bool) throws -> Data {
+        var output = Data(count: packet.count)
+        let status = output.withUnsafeMutableBytes { outputBytes -> Int32 in
+            packet.withUnsafeBytes { inputBytes in
+                key.withUnsafeBytes { keyBytes in
+                    iv.withUnsafeBufferPointer { ivBytes in
+                        shanghai_aes_cfb(
+                            keyBytes.bindMemory(to: UInt8.self).baseAddress,
+                            key.count,
+                            ivBytes.baseAddress,
+                            encrypt ? 1 : 0,
+                            inputBytes.bindMemory(to: UInt8.self).baseAddress,
+                            packet.count,
+                            outputBytes.bindMemory(to: UInt8.self).baseAddress
+                        )
+                    }
+                }
+            }
+        }
+        guard status == 0 else {
+            throw KcpPacketCodecError.cryptoFailed(status: status)
+        }
+        return output
+    }
+
+    /// PBKDF2-HMAC-SHA1 via the C implementation; same cross-validation
+    /// story as portableCrypt.
+    static func portableDeriveKey(password: String, length: Int) throws -> Data {
+        var derived = Data(count: length)
+        let passwordBytes = Array(password.utf8)
+        let status = derived.withUnsafeMutableBytes { derivedBytes -> Int32 in
+            salt.withUnsafeBytes { saltBytes in
+                shanghai_pbkdf2_sha1(
+                    passwordBytes,
+                    passwordBytes.count,
+                    saltBytes.bindMemory(to: UInt8.self).baseAddress,
+                    salt.count,
+                    4096,
+                    derivedBytes.bindMemory(to: UInt8.self).baseAddress,
+                    length
+                )
+            }
+        }
+        guard status == 0 else {
+            throw KcpPacketCodecError.keyDerivationFailed
+        }
+        return derived
+    }
+
+#if canImport(CommonCrypto)
+    static func commonCryptoCrypt(_ packet: Data, key: Data, encrypt: Bool) throws -> Data {
+        let operation = CCOperation(encrypt ? kCCEncrypt : kCCDecrypt)
         var cryptor: CCCryptorRef?
         let createStatus = key.withUnsafeBytes { keyBytes in
             Self.iv.withUnsafeBytes { ivBytes in
@@ -157,20 +221,25 @@ struct KcpPacketCodec: Sendable {
 
         output.removeSubrange((moved + finalMoved)..<output.count)
         return output
-#else
-        throw KcpPacketCodecError.cryptoUnavailable
-#endif
     }
+#endif
 
     private static func randomBytes(count: Int) throws -> Data {
-        let sodium = Sodium()
-        guard let bytes = sodium.randomBytes.buf(length: count) else {
-            throw KcpPacketCodecError.randomFailed
+        // SystemRandomNumberGenerator is cryptographically secure on every
+        // supported platform (arc4random / getrandom); the nonce only has
+        // to be unpredictable, no key material involved.
+        var generator = SystemRandomNumberGenerator()
+        var data = Data(capacity: count)
+        var remaining = count
+        while remaining > 0 {
+            let word: UInt64 = generator.next()
+            withUnsafeBytes(of: word) { data.append(contentsOf: $0.prefix(remaining)) }
+            remaining -= 8
         }
-        return Data(bytes)
+        return data
     }
 
-    private static func deriveKey(password: String, length: Int) throws -> Data {
+    static func deriveKey(password: String, length: Int) throws -> Data {
 #if canImport(CommonCrypto)
         var derivedKey = Data(repeating: 0, count: length)
         let status = derivedKey.withUnsafeMutableBytes { derivedKeyBytes in
@@ -193,7 +262,7 @@ struct KcpPacketCodec: Sendable {
         }
         return derivedKey
 #else
-        throw KcpPacketCodecError.cryptoUnavailable
+        return try portableDeriveKey(password: password, length: length)
 #endif
     }
 

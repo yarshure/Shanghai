@@ -6,6 +6,8 @@ import Foundation
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 public struct KcpConfiguration: Sendable {
@@ -75,6 +77,7 @@ public final class KcpSession: @unchecked Sendable {
 
     private let remoteHost: String
     private let remotePort: UInt16
+    private let localPort: UInt16?
     private let configuration: KcpConfiguration
     private let callbackQueue: DispatchQueue
     private let stateQueue = DispatchQueue(label: "shanghai.kcp.session")
@@ -95,14 +98,21 @@ public final class KcpSession: @unchecked Sendable {
 
     private static let kcpOverhead = 24
 
+    /// - Parameter localPort: optionally bind the UDP socket to a fixed
+    ///   local port before connecting. Symmetric peering (two forwarders
+    ///   dialing each other, hub-to-hub) needs BOTH ends on well-known
+    ///   ports — an ephemeral source port would be unknowable to the
+    ///   remote side's connect().
     public init(
         remoteHost: String,
         remotePort: UInt16,
+        localPort: UInt16? = nil,
         configuration: KcpConfiguration = .init(),
         callbackQueue: DispatchQueue = .main
     ) {
         self.remoteHost = remoteHost
         self.remotePort = remotePort
+        self.localPort = localPort
         self.configuration = configuration
         self.callbackQueue = callbackQueue
     }
@@ -133,7 +143,7 @@ public final class KcpSession: @unchecked Sendable {
             }
 
             KcpLog.info("starting session to \(remoteHost):\(remotePort) conv=\(configuration.conversationID)")
-            socketDescriptor = try Self.makeConnectedSocket(host: remoteHost, port: remotePort)
+            socketDescriptor = try Self.makeConnectedSocket(host: remoteHost, port: remotePort, localPort: localPort)
             try Self.makeSocketNonBlocking(socketDescriptor)
 
             guard let rawKcp = ikcp_create(configuration.conversationID, Unmanaged.passUnretained(self).toOpaque()) else {
@@ -253,7 +263,7 @@ public final class KcpSession: @unchecked Sendable {
                 guard let baseAddress = bytes.bindMemory(to: UInt8.self).baseAddress else {
                     return -1
                 }
-                return Darwin.recv(socketDescriptor, baseAddress, bytes.count, 0)
+                return Posix.recv(socketDescriptor, baseAddress, bytes.count, 0)
             }
 
             if count > 0 {
@@ -391,7 +401,7 @@ public final class KcpSession: @unchecked Sendable {
             }
             KcpLog.hexDump("udp send", data: data)
             let sent = data.withUnsafeBytes { bytes in
-                Darwin.send(socketDescriptor, bytes.baseAddress, data.count, 0)
+                Posix.send(socketDescriptor, bytes.baseAddress, data.count, 0)
             }
             if sent < 0 {
                 KcpLog.error("udp send failed errno=\(errno) remote=\(remoteHost):\(remotePort)")
@@ -459,17 +469,8 @@ public final class KcpSession: @unchecked Sendable {
         }
     }
 
-    private static func makeConnectedSocket(host: String, port: UInt16) throws -> Int32 {
-        var hints = addrinfo(
-            ai_flags: AI_NUMERICSERV,
-            ai_family: AF_UNSPEC,
-            ai_socktype: Self.socketTypeDatagram,
-            ai_protocol: IPPROTO_UDP,
-            ai_addrlen: 0,
-            ai_canonname: nil,
-            ai_addr: nil,
-            ai_next: nil
-        )
+    private static func makeConnectedSocket(host: String, port: UInt16, localPort: UInt16?) throws -> Int32 {
+        var hints = Posix.udpAddrInfoHints(passive: false)
 
         let service = String(port)
         var result: UnsafeMutablePointer<addrinfo>?
@@ -488,6 +489,11 @@ public final class KcpSession: @unchecked Sendable {
                     cursor = current.pointee.ai_next
                     continue
                 }
+                if let localPort, !bindLocalPort(fd, family: current.pointee.ai_family, port: localPort) {
+                    _ = close(fd)
+                    cursor = current.pointee.ai_next
+                    continue
+                }
                 let connected = connect(fd, address, current.pointee.ai_addrlen)
                 if connected == 0 {
                     return fd
@@ -498,6 +504,35 @@ public final class KcpSession: @unchecked Sendable {
         }
 
         throw KcpSessionError.connectFailed(code: errno)
+    }
+
+    /// Bind the not-yet-connected UDP socket to a fixed local port on the
+    /// wildcard address of the matching family.
+    private static func bindLocalPort(_ fd: Int32, family: Int32, port: UInt16) -> Bool {
+        var one: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+
+        if family == AF_INET {
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = port.bigEndian
+            return withUnsafePointer(to: &addr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+                }
+            }
+        }
+        if family == AF_INET6 {
+            var addr = sockaddr_in6()
+            addr.sin6_family = sa_family_t(AF_INET6)
+            addr.sin6_port = port.bigEndian
+            return withUnsafePointer(to: &addr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in6>.size)) == 0
+                }
+            }
+        }
+        return false
     }
 
     private static func makeSocketNonBlocking(_ fd: Int32) throws {
@@ -524,78 +559,40 @@ public final class KcpSession: @unchecked Sendable {
         return try packetCodec.decode(packet)
     }
 
-    private static var socketTypeDatagram: Int32 {
-#if canImport(Darwin)
-        Int32(SOCK_DGRAM)
-#else
-        SOCK_DGRAM.rawValue
-#endif
-    }
-
     private static func describeLocalEndpoint(_ fd: Int32) -> String? {
         var storage = sockaddr_storage()
-//        var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
-//        let result = withUnsafeMutablePointer(to: &storage) { pointer in
-//            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
-//                getsockname(fd, sockaddrPointer, &length)
-//            }
-//        }
-//        guard result == 0 else { return nil }
-//        // 假设 storage 是 sockaddr_storage，length 是该地址的实际长度
-//        var hostBuffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-//        var serviceBuffer = [CChar](repeating: 0, count: Int(NI_MAXSERV))
-//        let nameInfo = withUnsafePointer(to: &storage) { pointer in
-//            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
-//                getnameinfo(
-//                    sockaddrPointer,
-//                    socklen_t(length), // 确保转为 socklen_t,
-//                    &hostBuffer,
-//                    socklen_t(hostBuffer.count),
-//                    &serviceBuffer,
-//                    socklen_t(serviceBuffer.count),
-//                    NI_NUMERICHOST | NI_NUMERICSERV
-//                )
-//            }
-//        }
-//
-//        guard nameInfo == 0 else { return nil }
-//
-//        // 转换为 Swift String
-//        let host =   String(cString: hostBuffer)
-//        let service = String(cString: serviceBuffer)
-//        return "\(host):\(service)"
-        
-        // 针对 IPv4 的极致快速路径 (无需 getnameinfo)
+        var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        let result = withUnsafeMutablePointer(to: &storage) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                getsockname(fd, sockaddrPointer, &length)
+            }
+        }
+        guard result == 0 else { return nil }
+
         if storage.ss_family == sa_family_t(AF_INET) {
-            // IPv4 保持不变
             return withUnsafePointer(to: &storage) { ptr in
                 ptr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
                     let addr = sin.pointee.sin_addr.s_addr
-                    let p = sin.pointee.sin_port.byteSwapped
+                    let p = UInt16(bigEndian: sin.pointee.sin_port)
                     return "\(Int(addr & 0xFF)).\(Int((addr >> 8) & 0xFF)).\(Int((addr >> 16) & 0xFF)).\(Int((addr >> 24) & 0xFF)):\(p)"
                 }
             }
-        } else if storage.ss_family == sa_family_t(AF_INET6) {
-            // IPv6 高性能手动解析
+        }
+        if storage.ss_family == sa_family_t(AF_INET6) {
             return withUnsafePointer(to: &storage) { ptr in
                 ptr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { sin6 in
-                    let addr = sin6.pointee.sin6_addr.__u6_addr.__u6_addr16
-                    let p = sin6.pointee.sin6_port.byteSwapped
-                    
-                    // 提取 8 个 16 位片段（注意字节序转换）
-                    let segments = [
-                        addr.0.byteSwapped, addr.1.byteSwapped, addr.2.byteSwapped, addr.3.byteSwapped,
-                        addr.4.byteSwapped, addr.5.byteSwapped, addr.6.byteSwapped, addr.7.byteSwapped
-                    ]
-                    
-                    // 格式化为标准 IPv6 字符串 [addr]:port
+                    let p = UInt16(bigEndian: sin6.pointee.sin6_port)
+                    // in6_addr's union member names differ between Darwin
+                    // (__u6_addr) and Glibc (__in6_u) — read raw bytes instead.
+                    let segments = withUnsafeBytes(of: sin6.pointee.sin6_addr) { raw -> [UInt16] in
+                        (0..<8).map { UInt16(bigEndian: raw.loadUnaligned(fromByteOffset: $0 * 2, as: UInt16.self)) }
+                    }
                     let ipStr = segments.map { String(format: "%x", $0) }.joined(separator: ":")
                     return "[\(ipStr)]:\(p)"
                 }
             }
         }
-        return ""
-        
+        return nil
     }
 
     private func logKcpSegments(_ label: String, data: Data) {
