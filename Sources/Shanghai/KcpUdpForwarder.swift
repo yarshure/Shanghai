@@ -85,6 +85,11 @@ public final class KcpUdpForwarder: @unchecked Sendable {
     ///     address — fine for the initiator side, but a pure responder
     ///     would have to DROP inbound packets until its own WG speaks
     ///     first. Hub deployments should always set this.
+    ///   - listenMode: act as the KCP server — bind `kcpLocalPort` and learn
+    ///     the client's address from its first packet instead of connecting
+    ///     to `remoteHost:remotePort`. Use this on the side a NAT'd client
+    ///     dials (the client keeps listenMode = false). remoteHost/remotePort
+    ///     are ignored for transport in this mode (kept for logging).
     ///   - configuration: forced to message mode (`streamMode = false`). Crypt /
     ///     FEC / nodelay params MUST match the remote forwarder.
     public init(
@@ -93,6 +98,7 @@ public final class KcpUdpForwarder: @unchecked Sendable {
         remoteHost: String,
         remotePort: UInt16,
         kcpLocalPort: UInt16? = nil,
+        listenMode: Bool = false,
         wgEndpoint: (host: String, port: UInt16)? = nil,
         configuration: KcpConfiguration = .init()
     ) {
@@ -110,6 +116,7 @@ public final class KcpUdpForwarder: @unchecked Sendable {
             remoteHost: remoteHost,
             remotePort: remotePort,
             localPort: kcpLocalPort,
+            listenMode: listenMode,
             configuration: cfg,
             callbackQueue: queue
         )

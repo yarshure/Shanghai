@@ -150,6 +150,67 @@ struct KcpUdpForwarderTests {
         #expect(aInbox.first() == replySized, "B->A payload mangled")
     }
 
+    /// Server/listen mode: one forwarder binds and learns its peer from the
+    /// first inbound packet (the NAT'd-client topology), instead of both ends
+    /// dialing fixed ports. The client must speak first to bootstrap, after
+    /// which both directions flow. Mirrors the hub-as-server cross-border
+    /// deployment validated on 124.221.22.9.
+    @Test func serverModeLearnsPeerAndCarriesBothWays() throws {
+        let wgClientPort: UInt16 = 46_811, wgServerPort: UInt16 = 46_812
+        let listenClient: UInt16 = 46_813, listenServer: UInt16 = 46_814
+        let kcpClient: UInt16 = 46_815, kcpServer: UInt16 = 46_816
+
+        var configuration = KcpConfiguration()
+        configuration.conversationID = 123
+        configuration.crypt = .aes
+        configuration.preSharedKey = "servermode-test"
+        // FEC intentionally off — see KcpFEC variable-size bug note.
+        configuration.dataShards = 0
+        configuration.parityShards = 0
+
+        let wgClient = try FakeWireGuard(port: wgClientPort)
+        let wgServer = try FakeWireGuard(port: wgServerPort)
+
+        // Server binds kcpServer and learns the client; remoteHost/Port unused.
+        let server = KcpUdpForwarder(
+            localPort: listenServer,
+            remoteHost: "0.0.0.0", remotePort: 0,
+            kcpLocalPort: kcpServer,
+            listenMode: true,
+            wgEndpoint: (host: "127.0.0.1", port: wgServerPort),
+            configuration: configuration
+        )
+        // Client dials the server's kcp port (as if over the internet).
+        let client = KcpUdpForwarder(
+            localPort: listenClient,
+            remoteHost: "127.0.0.1", remotePort: kcpServer,
+            kcpLocalPort: kcpClient,
+            wgEndpoint: (host: "127.0.0.1", port: wgClientPort),
+            configuration: configuration
+        )
+        try server.start()
+        try client.start()
+        defer { client.stop(); server.stop() }
+
+        // Client speaks first → server learns it.
+        let req = Data((0..<148).map { UInt8($0 & 0xff) })
+        let atServer = DispatchSemaphore(value: 0)
+        let serverInbox = Inbox()
+        wgServer.onDatagram = { data in serverInbox.append(data); atServer.signal() }
+        wgClient.send(req, toPort: listenClient)
+        #expect(atServer.wait(timeout: .now() + 3) == .success, "client->server never arrived")
+        #expect(serverInbox.first() == req, "client->server payload mangled")
+
+        // Reply rides back to the learned client.
+        let resp = Data((0..<92).map { UInt8(($0 &* 5) & 0xff) })
+        let atClient = DispatchSemaphore(value: 0)
+        let clientInbox = Inbox()
+        wgClient.onDatagram = { data in clientInbox.append(data); atClient.signal() }
+        wgServer.send(resp, toPort: listenServer)
+        #expect(atClient.wait(timeout: .now() + 3) == .success, "server->client (learned) never arrived")
+        #expect(clientInbox.first() == resp, "server->client payload mangled")
+    }
+
     /// Tiny thread-safe holder so the @Sendable callbacks can hand
     /// datagrams back to the test body.
     private final class Inbox: @unchecked Sendable {

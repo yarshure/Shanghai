@@ -16,6 +16,24 @@ kernel wg, listen 1632                          kernel wg, listen 1632
 的同一端口，没有任何 accept/demux 逻辑。`--conv`、`--key`、`--crypt`、
 `--datashard/--parityshard` 两端必须一致。
 
+## NAT 后面的客户端（server 模式）
+
+对称 connect 只适用于两端都有固定公网端点（hub-to-hub）。当一端在 NAT 后面
+（移动端、家宽 spoke）时，公网侧用 `--server`：它 bind `--kcp-port` 并从客户端
+第一个包里**学习**对端地址，而不是 connect 一个未知端点。客户端不带 `--server`，
+正常 dial 公网侧的 `--kcp-port`。**客户端必须先发包**来 bootstrap（hub=server 时，
+从客户端侧先 ping 一下）。已在 124.221.22.9 实测：真·WG（macOS wireguard-go
+客户端 ↔ 内核 WG hub）跨真实网络跑通，~12ms，0 丢包。
+
+## ⚠️ 已知 bug：FEC 在真实链路上损坏 WG 流量
+
+`--datashard N --parityshard M`（FEC）目前有 bug：在**有抖动的真实链路**上，即使
+没有实际丢包，也会丢掉 ~75% 的 WireGuard 包（WG 的 anti-replay + poly1305 认证
+对 FEC 产生的重复/乱序/损坏包敏感；纯 echo 流量能容忍所以早期没暴露；loopback 无
+抖动也没暴露）。**暂时用 `--datashard 0 --parityshard 0` 关掉 FEC**。怀疑点：
+FEC 分片按组定长 padding，变长包（WG 握手 148 / 数据变长 / keepalive 32）的长度
+还原有问题。FEC 是抗 QoS 丢包的关键，必须修；见 KcpFEC.swift / KcpReedSolomon.swift。
+
 ## 构建（macOS 上交叉编译出 Linux 静态二进制）
 
 ```sh

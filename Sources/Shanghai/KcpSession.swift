@@ -100,21 +100,37 @@ public final class KcpSession: @unchecked Sendable {
 
     private static let kcpOverhead = 24
 
-    /// - Parameter localPort: optionally bind the UDP socket to a fixed
-    ///   local port before connecting. Symmetric peering (two forwarders
-    ///   dialing each other, hub-to-hub) needs BOTH ends on well-known
-    ///   ports — an ephemeral source port would be unknowable to the
-    ///   remote side's connect().
+    /// When true, the socket binds `localPort` and does NOT connect: the
+    /// remote address is LEARNED from the first inbound packet (recvfrom)
+    /// and KCP output is sent back with sendto. This is the server/responder
+    /// role for a client behind NAT — the server can't know the client's
+    /// NAT-mapped public ip:port ahead of time, so connect() is impossible.
+    /// Client role keeps `listenMode = false` (connect to a known remote).
+    private let listenMode: Bool
+
+    /// Learned peer address (listen mode only). Updated on every recvfrom so
+    /// a NAT rebinding mid-session is followed. stateQueue-confined.
+    private var learnedPeer: sockaddr_storage?
+    private var learnedPeerLen: socklen_t = 0
+
+    /// - Parameter localPort: in client mode, optionally bind the UDP socket
+    ///   to a fixed local port before connecting (symmetric hub-to-hub
+    ///   peering needs both ends on well-known ports). In listen mode this is
+    ///   REQUIRED — it is the public port the client dials.
+    /// - Parameter listenMode: act as the server (bind + learn peer via
+    ///   recvfrom) instead of the client (connect to remoteHost:remotePort).
     public init(
         remoteHost: String,
         remotePort: UInt16,
         localPort: UInt16? = nil,
+        listenMode: Bool = false,
         configuration: KcpConfiguration = .init(),
         callbackQueue: DispatchQueue = .main
     ) {
         self.remoteHost = remoteHost
         self.remotePort = remotePort
         self.localPort = localPort
+        self.listenMode = listenMode
         self.configuration = configuration
         self.callbackQueue = callbackQueue
     }
@@ -144,8 +160,16 @@ public final class KcpSession: @unchecked Sendable {
                 throw KcpSessionError.alreadyStarted
             }
 
-            KcpLog.info("starting session to \(remoteHost):\(remotePort) conv=\(configuration.conversationID)")
-            socketDescriptor = try Self.makeConnectedSocket(host: remoteHost, port: remotePort, localPort: localPort)
+            if listenMode {
+                guard let bindPort = localPort else {
+                    throw KcpSessionError.socketConfigurationFailed(code: EINVAL)
+                }
+                KcpLog.info("starting LISTEN session on :\(bindPort) conv=\(configuration.conversationID)")
+                socketDescriptor = try Self.makeListenSocket(port: bindPort)
+            } else {
+                KcpLog.info("starting session to \(remoteHost):\(remotePort) conv=\(configuration.conversationID)")
+                socketDescriptor = try Self.makeConnectedSocket(host: remoteHost, port: remotePort, localPort: localPort)
+            }
             try Self.makeSocketNonBlocking(socketDescriptor)
 
             guard let rawKcp = ikcp_create(configuration.conversationID, Unmanaged.passUnretained(self).toOpaque()) else {
@@ -264,6 +288,22 @@ public final class KcpSession: @unchecked Sendable {
             let count = receiveBuffer.withUnsafeMutableBytes { bytes -> Int in
                 guard let baseAddress = bytes.bindMemory(to: UInt8.self).baseAddress else {
                     return -1
+                }
+                if listenMode {
+                    // Learn (or re-learn, for NAT rebinding) the client's
+                    // address on every datagram so KCP output can reply.
+                    var from = sockaddr_storage()
+                    var fromLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+                    let n = withUnsafeMutablePointer(to: &from) { sa in
+                        sa.withMemoryRebound(to: sockaddr.self, capacity: 1) { sap in
+                            Posix.recvfrom(socketDescriptor, baseAddress, bytes.count, 0, sap, &fromLen)
+                        }
+                    }
+                    if n > 0 {
+                        learnedPeer = from
+                        learnedPeerLen = fromLen
+                    }
+                    return n
                 }
                 return Posix.recv(socketDescriptor, baseAddress, bytes.count, 0)
             }
@@ -402,8 +442,24 @@ public final class KcpSession: @unchecked Sendable {
                 return -1
             }
             KcpLog.hexDump("udp send", data: data)
-            let sent = data.withUnsafeBytes { bytes in
-                Posix.send(socketDescriptor, bytes.baseAddress, data.count, 0)
+            let sent: Int
+            if listenMode {
+                // No connect(): reply to the learned client address. Before
+                // the first inbound packet there is nowhere to send — KCP
+                // will retransmit, so just report success and wait.
+                guard var peer = learnedPeer else { return length }
+                let peerLen = learnedPeerLen
+                sent = data.withUnsafeBytes { bytes in
+                    withUnsafeMutablePointer(to: &peer) { sa in
+                        sa.withMemoryRebound(to: sockaddr.self, capacity: 1) { sap in
+                            Posix.sendto(socketDescriptor, bytes.baseAddress, data.count, 0, sap, peerLen)
+                        }
+                    }
+                }
+            } else {
+                sent = data.withUnsafeBytes { bytes in
+                    Posix.send(socketDescriptor, bytes.baseAddress, data.count, 0)
+                }
             }
             if sent < 0 {
                 KcpLog.error("udp send failed errno=\(errno) remote=\(remoteHost):\(remotePort)")
@@ -469,6 +525,35 @@ public final class KcpSession: @unchecked Sendable {
                 onStop?(error)
             }
         }
+    }
+
+    /// Listen-mode socket: bind the wildcard address on `port`, no connect.
+    /// Tries IPv6 (dual-stack via the kernel default) then IPv4.
+    private static func makeListenSocket(port: UInt16) throws -> Int32 {
+        var hints = Posix.udpAddrInfoHints(passive: true)
+        var result: UnsafeMutablePointer<addrinfo>?
+        let status = getaddrinfo(nil, String(port), &hints, &result)
+        guard status == 0, let first = result else {
+            throw KcpSessionError.addressResolutionFailed(code: Int32(status))
+        }
+        defer { freeaddrinfo(first) }
+
+        var cursor: UnsafeMutablePointer<addrinfo>? = first
+        while let current = cursor {
+            let fd = socket(current.pointee.ai_family, current.pointee.ai_socktype, current.pointee.ai_protocol)
+            if fd >= 0, let address = current.pointee.ai_addr {
+                var one: Int32 = 1
+                setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+                if bind(fd, address, current.pointee.ai_addrlen) == 0 {
+                    return fd
+                }
+                _ = close(fd)
+            } else if fd >= 0 {
+                _ = close(fd)
+            }
+            cursor = current.pointee.ai_next
+        }
+        throw KcpSessionError.socketConfigurationFailed(code: errno)
     }
 
     private static func makeConnectedSocket(host: String, port: UInt16, localPort: UInt16?) throws -> Int32 {

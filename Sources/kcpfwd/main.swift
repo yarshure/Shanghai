@@ -64,6 +64,7 @@ struct ForwarderOptions {
     var wg: (host: String, port: UInt16)?
     var peer: (host: String, port: UInt16)?
     var kcpPort: UInt16?
+    var server = false
     var conv: UInt32?
     var key = "it's a secrect"
     var crypt = KcpPacketCryptoMethod.aes
@@ -82,8 +83,15 @@ required:
   --listen <port>        local UDP port WireGuard's Endpoint points at
   --wg <host:port>       where the local WireGuard listens (e.g. 127.0.0.1:1632)
   --peer <host:port>     the remote kcpfwd's --kcp-port endpoint
+                         (omit with --server: the client's addr is learned)
   --kcp-port <port>      fixed local UDP port for the KCP transport
+                         (with --server this is the PUBLIC port clients dial)
   --conv <id>            KCP conversation id, identical on both ends
+
+  --server               act as the KCP server for a NAT'd client: bind
+                         --kcp-port and learn the peer from its first packet
+                         instead of connecting to --peer. The client side
+                         runs WITHOUT --server and dials this --kcp-port.
 
 options (must match the remote end):
   --key <psk>            pre-shared key            (default: kcptun default)
@@ -123,6 +131,8 @@ func parseOptions(_ arguments: [String]) throws -> ForwarderOptions {
         case "--kcp-port":
             guard let port = UInt16(try value(flag)) else { throw CLIError(description: "--kcp-port: bad port") }
             options.kcpPort = port
+        case "--server":
+            options.server = true
         case "--conv":
             guard let conv = UInt32(try value(flag)) else { throw CLIError(description: "--conv: bad id") }
             options.conv = conv
@@ -160,9 +170,17 @@ func parseOptions(_ arguments: [String]) throws -> ForwarderOptions {
 
     guard options.listenPort > 0 else { throw CLIError(description: "--listen is required") }
     guard options.wg != nil else { throw CLIError(description: "--wg is required") }
-    guard options.peer != nil else { throw CLIError(description: "--peer is required") }
     guard options.kcpPort != nil else { throw CLIError(description: "--kcp-port is required") }
-    guard options.conv != nil else { throw CLIError(description: "--conv is required (same value on both hubs)") }
+    guard options.conv != nil else { throw CLIError(description: "--conv is required (same value on both ends)") }
+    if options.server {
+        // Server learns the peer; --peer is meaningless and a NAT'd client's
+        // address is unknowable up front.
+        if options.peer != nil {
+            throw CLIError(description: "--peer must be omitted with --server (peer is learned)")
+        }
+    } else {
+        guard options.peer != nil else { throw CLIError(description: "--peer is required (or use --server)") }
+    }
     return options
 }
 
@@ -188,9 +206,10 @@ configuration.parityShards = options.parityShards
 let forwarder = KcpUdpForwarder(
     localHost: options.listenHost,
     localPort: options.listenPort,
-    remoteHost: options.peer!.host,
-    remotePort: options.peer!.port,
+    remoteHost: options.peer?.host ?? "0.0.0.0",
+    remotePort: options.peer?.port ?? 0,
     kcpLocalPort: options.kcpPort,
+    listenMode: options.server,
     wgEndpoint: options.wg,
     configuration: configuration
 )
@@ -210,7 +229,8 @@ do {
     exit(1)
 }
 
-print("kcpfwd: wg-facing \(options.listenHost):\(options.listenPort) -> kcp \(options.peer!.host):\(options.peer!.port) (local kcp port \(options.kcpPort!), conv \(options.conv!), crypt \(options.crypt.rawValue), fec \(options.dataShards)/\(options.parityShards)), wg listener \(options.wg!.host):\(options.wg!.port)")
+let kcpTarget = options.server ? "LISTEN :\(options.kcpPort!) (learn client)" : "\(options.peer!.host):\(options.peer!.port) (local kcp port \(options.kcpPort!))"
+print("kcpfwd: wg-facing \(options.listenHost):\(options.listenPort) -> kcp \(kcpTarget), conv \(options.conv!), crypt \(options.crypt.rawValue), fec \(options.dataShards)/\(options.parityShards), wg listener \(options.wg!.host):\(options.wg!.port)")
 
 // Clean shutdown on SIGINT/SIGTERM. signal() ignores so the dispatch
 // sources are the only consumers.
