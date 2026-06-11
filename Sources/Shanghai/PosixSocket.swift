@@ -89,10 +89,12 @@ enum Posix {
     }
 
     static var socketTypeDatagram: Int32 {
-#if canImport(Glibc)
-        Int32(SOCK_DGRAM.rawValue) // Glibc imports it as a __socket_type enum
+#if canImport(Glibc) && os(Linux)
+        Int32(SOCK_DGRAM.rawValue) // Linux glibc imports it as a __socket_type enum
 #else
-        Int32(SOCK_DGRAM) // Darwin & Musl: plain integer constant
+        // Darwin / musl / FreeBSD (libc module is also named Glibc, but
+        // SOCK_DGRAM is a plain Int32) / Android: plain integer constant.
+        Int32(SOCK_DGRAM)
 #endif
     }
 
