@@ -1,15 +1,6 @@
 {
-  "originHash" : "3a160e6caf8982c56de703484082e2e8795e17b772a5ddb1714a4066308c8a7c",
+  "originHash" : "30308f5f4ef24e128bbb3744731dae96d791f4c247af776555fbb1e74a46dc4a",
   "pins" : [
-    {
-      "identity" : "liso",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/yarshure/Liso",
-      "state" : {
-        "branch" : "main",
-        "revision" : "7c13205c5e09c6d66497e427f59a11ae6cb46597"
-      }
-    },
     {
       "identity" : "snappy.swift",
       "kind" : "remoteSourceControl",
@@ -17,15 +8,6 @@
       "state" : {
         "revision" : "4ce38540e8131f75682a9dd8b36e65ec3979f645",
         "version" : "1.0.0"
-      }
-    },
-    {
-      "identity" : "swift-sodium",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/jedisct1/swift-sodium.git",
-      "state" : {
-        "revision" : "e7e799cd1eaa4d0f6d3eab56832e7f4b377f4a4f",
-        "version" : "0.10.0"
       }
     }
   ],

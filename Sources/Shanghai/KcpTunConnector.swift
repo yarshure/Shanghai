@@ -1,6 +1,5 @@
 import Dispatch
 import Foundation
-import snappy
 
 public protocol KcpTunStreamHandler: Sendable, AnyObject {
     var sessionID: UInt32 { get }

@@ -1,0 +1,18 @@
+// Explicit module map for the CKcp target.
+//
+// Some headers in this directory (reedsolomon.h, matrix.h, galois.h,
+// inversion_tree.h, galois_noasm.h) are C++ and pull in <vector> /
+// <memory>. SPM's auto-generated module map would try to expose all
+// of them to Swift via Clang's importer, which can't parse C++
+// templates and ends up exposing nothing.
+//
+// Solution: list ONLY the pure-C headers we want Swift to see. The
+// C++ headers stay reachable from the .cpp sources at compile time
+// because they live in the same directory; they just don't form
+// part of the public Swift module surface.
+module CKcp {
+    header "ikcp.h"           // KCP protocol C API used by KcpSession
+    header "kcp_rs.h"         // Reed-Solomon extern "C" wrapper
+    header "shanghai_crypt.h" // portable AES-CFB + PBKDF2-SHA1 (KcpPacketCodec)
+    export *
+}

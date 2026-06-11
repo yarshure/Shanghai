@@ -6,6 +6,10 @@ import Foundation
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Android)
+import Android
 #endif
 
 public struct KcpConfiguration: Sendable {
@@ -20,6 +24,13 @@ public struct KcpConfiguration: Sendable {
     public var streamMode: Bool
     public var preSharedKey: String
     public var crypt: KcpPacketCryptoMethod
+    /// Number of data shards per FEC group. 0 disables FEC framing
+    /// entirely (kcp UDP packets go directly to the packet codec).
+    /// Must match the kcptun-server's `--datashard` flag.
+    public var dataShards: Int
+    /// Number of parity shards per FEC group. 0 disables FEC.
+    /// Must match the kcptun-server's `--parityshard` flag.
+    public var parityShards: Int
 
     public init(
         conversationID: UInt32 = UInt32.random(in: 1...UInt32.max),
@@ -32,7 +43,9 @@ public struct KcpConfiguration: Sendable {
         disableCongestionControl: Int32 = 1,
         streamMode: Bool = true,
         preSharedKey: String = "it's a secrect",
-        crypt: KcpPacketCryptoMethod = .none
+        crypt: KcpPacketCryptoMethod = .none,
+        dataShards: Int = 0,
+        parityShards: Int = 0
     ) {
         self.conversationID = conversationID
         self.mtu = mtu
@@ -45,6 +58,8 @@ public struct KcpConfiguration: Sendable {
         self.streamMode = streamMode
         self.preSharedKey = preSharedKey
         self.crypt = crypt
+        self.dataShards = dataShards
+        self.parityShards = parityShards
     }
 }
 
@@ -64,6 +79,7 @@ public final class KcpSession: @unchecked Sendable {
 
     private let remoteHost: String
     private let remotePort: UInt16
+    private let localPort: UInt16?
     private let configuration: KcpConfiguration
     private let callbackQueue: DispatchQueue
     private let stateQueue = DispatchQueue(label: "shanghai.kcp.session")
@@ -76,25 +92,66 @@ public final class KcpSession: @unchecked Sendable {
     private var stopped = false
     private var receiveBuffer = [UInt8](repeating: 0, count: 65_535)
     private var packetCodec: KcpPacketCodec?
+    /// Outbound FEC encoder; nil when configuration.dataShards == 0
+    /// (kcptun-server started with `--datashard 0 --parityshard 0`).
+    private var fecEncoder: KcpFECEncoder?
+    /// Inbound FEC decoder. Lifecycle mirrors fecEncoder.
+    private var fecDecoder: KcpFECDecoder?
 
     private static let kcpOverhead = 24
 
+    /// When true, the socket binds `localPort` and does NOT connect: the
+    /// remote address is LEARNED from the first inbound packet (recvfrom)
+    /// and KCP output is sent back with sendto. This is the server/responder
+    /// role for a client behind NAT — the server can't know the client's
+    /// NAT-mapped public ip:port ahead of time, so connect() is impossible.
+    /// Client role keeps `listenMode = false` (connect to a known remote).
+    private let listenMode: Bool
+
+    /// Learned peer address (listen mode only). Updated on every recvfrom so
+    /// a NAT rebinding mid-session is followed. stateQueue-confined.
+    private var learnedPeer: sockaddr_storage?
+    private var learnedPeerLen: socklen_t = 0
+
+    /// - Parameter localPort: in client mode, optionally bind the UDP socket
+    ///   to a fixed local port before connecting (symmetric hub-to-hub
+    ///   peering needs both ends on well-known ports). In listen mode this is
+    ///   REQUIRED — it is the public port the client dials.
+    /// - Parameter listenMode: act as the server (bind + learn peer via
+    ///   recvfrom) instead of the client (connect to remoteHost:remotePort).
     public init(
         remoteHost: String,
         remotePort: UInt16,
+        localPort: UInt16? = nil,
+        listenMode: Bool = false,
         configuration: KcpConfiguration = .init(),
         callbackQueue: DispatchQueue = .main
     ) {
         self.remoteHost = remoteHost
         self.remotePort = remotePort
+        self.localPort = localPort
+        self.listenMode = listenMode
         self.configuration = configuration
         self.callbackQueue = callbackQueue
     }
 
     deinit {
-        stateQueue.sync {
-            shutdown(nil, notify: false)
-        }
+        // Cannot dispatch_sync to stateQueue from deinit — deinit
+        // can fire from a closure already executing ON stateQueue
+        // (e.g. send()'s `stateQueue.async { [weak self] in guard
+        // let self … }` upgrades to a strong ref for the body, and
+        // when the last external strong ref has been dropped, the
+        // closure's tail-release IS the final release → deinit
+        // runs inline on stateQueue → sync from same queue
+        // deadlocks in __DISPATCH_WAIT_FOR_QUEUE__).
+        //
+        // Direct call is safe by ARC contract: at deinit-time no
+        // other thread holds a reference. All dispatch sources
+        // (readSource, updateTimer) captured `[weak self]` and
+        // would no-op via `self?`; any pending dispatched blocks
+        // that captured `[weak self]` will hit `guard let self`
+        // and fall through cleanly.
+        shutdown(nil, notify: false)
     }
 
     public func start() throws {
@@ -103,8 +160,16 @@ public final class KcpSession: @unchecked Sendable {
                 throw KcpSessionError.alreadyStarted
             }
 
-            KcpLog.info("starting session to \(remoteHost):\(remotePort) conv=\(configuration.conversationID)")
-            socketDescriptor = try Self.makeConnectedSocket(host: remoteHost, port: remotePort)
+            if listenMode {
+                guard let bindPort = localPort else {
+                    throw KcpSessionError.socketConfigurationFailed(code: EINVAL)
+                }
+                KcpLog.info("starting LISTEN session on :\(bindPort) conv=\(configuration.conversationID)")
+                socketDescriptor = try Self.makeListenSocket(port: bindPort)
+            } else {
+                KcpLog.info("starting session to \(remoteHost):\(remotePort) conv=\(configuration.conversationID)")
+                socketDescriptor = try Self.makeConnectedSocket(host: remoteHost, port: remotePort, localPort: localPort)
+            }
             try Self.makeSocketNonBlocking(socketDescriptor)
 
             guard let rawKcp = ikcp_create(configuration.conversationID, Unmanaged.passUnretained(self).toOpaque()) else {
@@ -127,6 +192,26 @@ public final class KcpSession: @unchecked Sendable {
             )
             rawKcp.pointee.stream = configuration.streamMode ? 1 : 0
             packetCodec = try? KcpPacketCodec(crypt: configuration.crypt, password: configuration.preSharedKey)
+
+            // Initialise FEC if the caller asked for it. Both
+            // shards must be > 0 to enable; either being 0 means
+            // FEC framing is disabled and KCP UDP datagrams flow
+            // straight through the packet codec.
+            if configuration.dataShards > 0 && configuration.parityShards > 0 {
+                do {
+                    fecEncoder = try KcpFECEncoder(
+                        dataShards: configuration.dataShards,
+                        parityShards: configuration.parityShards)
+                    fecDecoder = try KcpFECDecoder(
+                        dataShards: configuration.dataShards,
+                        parityShards: configuration.parityShards)
+                    KcpLog.info("FEC enabled datashard=\(configuration.dataShards) parityshard=\(configuration.parityShards) remote=\(remoteHost):\(remotePort)")
+                } catch {
+                    KcpLog.error("FEC init failed datashard=\(configuration.dataShards) parityshard=\(configuration.parityShards) error=\(error) — proceeding without FEC")
+                    fecEncoder = nil
+                    fecDecoder = nil
+                }
+            }
 
             installReadSource()
             installUpdateTimer()
@@ -204,7 +289,23 @@ public final class KcpSession: @unchecked Sendable {
                 guard let baseAddress = bytes.bindMemory(to: UInt8.self).baseAddress else {
                     return -1
                 }
-                return Darwin.recv(socketDescriptor, baseAddress, bytes.count, 0)
+                if listenMode {
+                    // Learn (or re-learn, for NAT rebinding) the client's
+                    // address on every datagram so KCP output can reply.
+                    var from = sockaddr_storage()
+                    var fromLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+                    let n = withUnsafeMutablePointer(to: &from) { sa in
+                        sa.withMemoryRebound(to: sockaddr.self, capacity: 1) { sap in
+                            Posix.recvfrom(socketDescriptor, baseAddress, bytes.count, 0, sap, &fromLen)
+                        }
+                    }
+                    if n > 0 {
+                        learnedPeer = from
+                        learnedPeerLen = fromLen
+                    }
+                    return n
+                }
+                return Posix.recv(socketDescriptor, baseAddress, bytes.count, 0)
             }
 
             if count > 0 {
@@ -213,13 +314,18 @@ public final class KcpSession: @unchecked Sendable {
                 KcpLog.hexDump("udp recv", data: packet)
                 do {
                     let payload = try decodePacket(packet)
-                    logKcpSegments("udp recv payload", data: payload)
-                    payload.withUnsafeBytes { bytes in
-                        guard let baseAddress = bytes.bindMemory(to: Int8.self).baseAddress else {
-                            return
+                    // FEC framing layer (when enabled). Each plaintext
+                    // packet is `[seqid|flag|...]` per kcptun-go's
+                    // wire format; the decoder surfaces immediate
+                    // KCP packets and any reconstructed ones.
+                    let kcpPackets = unframeFEC(payload)
+                    for kcp in kcpPackets {
+                        logKcpSegments("udp recv payload", data: kcp)
+                        kcp.withUnsafeBytes { bytes in
+                            guard let baseAddress = bytes.bindMemory(to: Int8.self).baseAddress else { return }
+                            let inputResult = ikcp_input(rawKcp, baseAddress, Int(bytes.count))
+                            KcpLog.trace("ikcp_input result=\(inputResult) payloadBytes=\(bytes.count) remote=\(remoteHost):\(remotePort)")
                         }
-                        let inputResult = ikcp_input(rawKcp, baseAddress, Int(bytes.count))
-                        KcpLog.trace("ikcp_input result=\(inputResult) payloadBytes=\(bytes.count) remote=\(remoteHost):\(remotePort)")
                     }
                     logKcpState("after input")
                     updateKcpNow()
@@ -237,6 +343,21 @@ public final class KcpSession: @unchecked Sendable {
             }
 
             if errno == EAGAIN || errno == EWOULDBLOCK {
+                break
+            }
+
+            // ICMP-derived async errors on a CONNECTED UDP socket are
+            // TRANSIENT, not session-fatal: ECONNREFUSED = the peer's port
+            // wasn't open *for one datagram* (server restarting / not up
+            // yet), ECONNRESET / EHOSTUNREACH / ENETUNREACH / EHOSTDOWN =
+            // transient routing or ICMP rate-limiting. Killing the session
+            // here means a single server blip permanently drops every
+            // client (observed: a client died on errno 61 the instant the
+            // server bounced and never came back). Swallow it — KCP keeps
+            // retransmitting and the link self-heals when the peer returns.
+            if errno == ECONNREFUSED || errno == ECONNRESET
+                || errno == EHOSTUNREACH || errno == ENETUNREACH || errno == EHOSTDOWN {
+                KcpLog.trace("socket transient errno=\(errno) (ignored) remote=\(remoteHost):\(remotePort)")
                 break
             }
 
@@ -313,27 +434,78 @@ public final class KcpSession: @unchecked Sendable {
 
     fileprivate func writeKcpPacket(_ buffer: UnsafePointer<Int8>, length: Int32) -> Int32 {
         guard socketDescriptor >= 0 else { return -1 }
-        let payload = Data(bytes: buffer, count: Int(length))
-        let data: Data
-        do {
-            data = try encodePacket(payload)
-        } catch {
-            KcpLog.error("udp packet encode failed remote=\(remoteHost):\(remotePort) error=\(error)")
-            return -1
+        let kcpPacket = Data(bytes: buffer, count: Int(length))
+
+        // FEC framing layer (when enabled). One KCP packet expands
+        // into 1 data frame plus optionally `parityShards` parity
+        // frames at every group boundary. Each frame is then routed
+        // through the packet codec (AES) before going on the wire.
+        let frames: [Data]
+        if let fecEncoder {
+            frames = fecEncoder.encode(kcpPacket: kcpPacket)
+        } else {
+            frames = [kcpPacket]
         }
-        KcpLog.hexDump("udp send", data: data)
-        if let plaintext = try? decodePacket(data) {
-            logKcpSegments("udp send payload", data: plaintext)
+
+        var totalSent: Int32 = 0
+        for frame in frames {
+            let data: Data
+            do {
+                data = try encodePacket(frame)
+            } catch {
+                KcpLog.error("udp packet encode failed remote=\(remoteHost):\(remotePort) error=\(error)")
+                return -1
+            }
+            KcpLog.hexDump("udp send", data: data)
+            let sent: Int
+            if listenMode {
+                // No connect(): reply to the learned client address. Before
+                // the first inbound packet there is nowhere to send — KCP
+                // will retransmit, so just report success and wait.
+                guard var peer = learnedPeer else { return length }
+                let peerLen = learnedPeerLen
+                sent = data.withUnsafeBytes { bytes in
+                    withUnsafeMutablePointer(to: &peer) { sa in
+                        sa.withMemoryRebound(to: sockaddr.self, capacity: 1) { sap in
+                            Posix.sendto(socketDescriptor, bytes.baseAddress, data.count, 0, sap, peerLen)
+                        }
+                    }
+                }
+            } else {
+                sent = data.withUnsafeBytes { bytes in
+                    Posix.send(socketDescriptor, bytes.baseAddress, data.count, 0)
+                }
+            }
+            if sent < 0 {
+                KcpLog.error("udp send failed errno=\(errno) remote=\(remoteHost):\(remotePort)")
+                return -1
+            }
+            KcpLog.trace("udp send bytes=\(sent) frame=\(frames.firstIndex(of: frame).map(String.init) ?? "?")/\(frames.count) remote=\(remoteHost):\(remotePort)")
+            // Only the data frame counts toward what KCP thinks it sent;
+            // parity frames are parallel UDP work, not KCP layer.
+            if totalSent == 0 { totalSent = Int32(sent) }
         }
-        let sent = data.withUnsafeBytes { bytes in
-            Darwin.send(socketDescriptor, bytes.baseAddress, data.count, 0)
+        return totalSent
+    }
+
+    /// Unwrap a plaintext UDP payload through the FEC framing layer
+    /// (when enabled). Without FEC the input passes through as a
+    /// single KCP packet. With FEC, each arriving frame is
+    /// `[seqid|flag|...]`; the decoder surfaces the inner KCP packet
+    /// from data frames and any reconstructed packets when a group
+    /// completes with missing data shards.
+    private func unframeFEC(_ payload: Data) -> [Data] {
+        guard let fecDecoder else { return [payload] }
+        var out: [Data] = []
+        for result in fecDecoder.decode(framedPacket: payload) {
+            switch result {
+            case .immediate(let kcp):
+                out.append(kcp)
+            case .recovered(let kcps):
+                out.append(contentsOf: kcps)
+            }
         }
-        if sent < 0 {
-            KcpLog.error("udp send failed errno=\(errno) remote=\(remoteHost):\(remotePort)")
-            return -1
-        }
-        KcpLog.trace("udp send bytes=\(sent) remote=\(remoteHost):\(remotePort)")
-        return Int32(sent)
+        return out
     }
 
     private func shutdown(_ error: Error?, notify: Bool) {
@@ -370,17 +542,37 @@ public final class KcpSession: @unchecked Sendable {
         }
     }
 
-    private static func makeConnectedSocket(host: String, port: UInt16) throws -> Int32 {
-        var hints = addrinfo(
-            ai_flags: AI_NUMERICSERV,
-            ai_family: AF_UNSPEC,
-            ai_socktype: Self.socketTypeDatagram,
-            ai_protocol: IPPROTO_UDP,
-            ai_addrlen: 0,
-            ai_canonname: nil,
-            ai_addr: nil,
-            ai_next: nil
-        )
+    /// Listen-mode socket: bind the wildcard address on `port`, no connect.
+    /// Tries IPv6 (dual-stack via the kernel default) then IPv4.
+    private static func makeListenSocket(port: UInt16) throws -> Int32 {
+        var hints = Posix.udpAddrInfoHints(passive: true)
+        var result: UnsafeMutablePointer<addrinfo>?
+        let status = getaddrinfo(nil, String(port), &hints, &result)
+        guard status == 0, let first = result else {
+            throw KcpSessionError.addressResolutionFailed(code: Int32(status))
+        }
+        defer { freeaddrinfo(first) }
+
+        var cursor: UnsafeMutablePointer<addrinfo>? = first
+        while let current = cursor {
+            let fd = socket(current.pointee.ai_family, current.pointee.ai_socktype, current.pointee.ai_protocol)
+            if fd >= 0, let address = current.pointee.ai_addr {
+                var one: Int32 = 1
+                setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+                if bind(fd, address, current.pointee.ai_addrlen) == 0 {
+                    return fd
+                }
+                _ = close(fd)
+            } else if fd >= 0 {
+                _ = close(fd)
+            }
+            cursor = current.pointee.ai_next
+        }
+        throw KcpSessionError.socketConfigurationFailed(code: errno)
+    }
+
+    private static func makeConnectedSocket(host: String, port: UInt16, localPort: UInt16?) throws -> Int32 {
+        var hints = Posix.udpAddrInfoHints(passive: false)
 
         let service = String(port)
         var result: UnsafeMutablePointer<addrinfo>?
@@ -399,6 +591,11 @@ public final class KcpSession: @unchecked Sendable {
                     cursor = current.pointee.ai_next
                     continue
                 }
+                if let localPort, !bindLocalPort(fd, family: current.pointee.ai_family, port: localPort) {
+                    _ = close(fd)
+                    cursor = current.pointee.ai_next
+                    continue
+                }
                 let connected = connect(fd, address, current.pointee.ai_addrlen)
                 if connected == 0 {
                     return fd
@@ -409,6 +606,35 @@ public final class KcpSession: @unchecked Sendable {
         }
 
         throw KcpSessionError.connectFailed(code: errno)
+    }
+
+    /// Bind the not-yet-connected UDP socket to a fixed local port on the
+    /// wildcard address of the matching family.
+    private static func bindLocalPort(_ fd: Int32, family: Int32, port: UInt16) -> Bool {
+        var one: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+
+        if family == AF_INET {
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = port.bigEndian
+            return withUnsafePointer(to: &addr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+                }
+            }
+        }
+        if family == AF_INET6 {
+            var addr = sockaddr_in6()
+            addr.sin6_family = sa_family_t(AF_INET6)
+            addr.sin6_port = port.bigEndian
+            return withUnsafePointer(to: &addr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in6>.size)) == 0
+                }
+            }
+        }
+        return false
     }
 
     private static func makeSocketNonBlocking(_ fd: Int32) throws {
@@ -435,78 +661,40 @@ public final class KcpSession: @unchecked Sendable {
         return try packetCodec.decode(packet)
     }
 
-    private static var socketTypeDatagram: Int32 {
-#if canImport(Darwin)
-        Int32(SOCK_DGRAM)
-#else
-        SOCK_DGRAM.rawValue
-#endif
-    }
-
     private static func describeLocalEndpoint(_ fd: Int32) -> String? {
         var storage = sockaddr_storage()
-//        var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
-//        let result = withUnsafeMutablePointer(to: &storage) { pointer in
-//            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
-//                getsockname(fd, sockaddrPointer, &length)
-//            }
-//        }
-//        guard result == 0 else { return nil }
-//        // 假设 storage 是 sockaddr_storage，length 是该地址的实际长度
-//        var hostBuffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-//        var serviceBuffer = [CChar](repeating: 0, count: Int(NI_MAXSERV))
-//        let nameInfo = withUnsafePointer(to: &storage) { pointer in
-//            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
-//                getnameinfo(
-//                    sockaddrPointer,
-//                    socklen_t(length), // 确保转为 socklen_t,
-//                    &hostBuffer,
-//                    socklen_t(hostBuffer.count),
-//                    &serviceBuffer,
-//                    socklen_t(serviceBuffer.count),
-//                    NI_NUMERICHOST | NI_NUMERICSERV
-//                )
-//            }
-//        }
-//
-//        guard nameInfo == 0 else { return nil }
-//
-//        // 转换为 Swift String
-//        let host =   String(cString: hostBuffer)
-//        let service = String(cString: serviceBuffer)
-//        return "\(host):\(service)"
-        
-        // 针对 IPv4 的极致快速路径 (无需 getnameinfo)
+        var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        let result = withUnsafeMutablePointer(to: &storage) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                getsockname(fd, sockaddrPointer, &length)
+            }
+        }
+        guard result == 0 else { return nil }
+
         if storage.ss_family == sa_family_t(AF_INET) {
-            // IPv4 保持不变
             return withUnsafePointer(to: &storage) { ptr in
                 ptr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
                     let addr = sin.pointee.sin_addr.s_addr
-                    let p = sin.pointee.sin_port.byteSwapped
+                    let p = UInt16(bigEndian: sin.pointee.sin_port)
                     return "\(Int(addr & 0xFF)).\(Int((addr >> 8) & 0xFF)).\(Int((addr >> 16) & 0xFF)).\(Int((addr >> 24) & 0xFF)):\(p)"
                 }
             }
-        } else if storage.ss_family == sa_family_t(AF_INET6) {
-            // IPv6 高性能手动解析
+        }
+        if storage.ss_family == sa_family_t(AF_INET6) {
             return withUnsafePointer(to: &storage) { ptr in
                 ptr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { sin6 in
-                    let addr = sin6.pointee.sin6_addr.__u6_addr.__u6_addr16
-                    let p = sin6.pointee.sin6_port.byteSwapped
-                    
-                    // 提取 8 个 16 位片段（注意字节序转换）
-                    let segments = [
-                        addr.0.byteSwapped, addr.1.byteSwapped, addr.2.byteSwapped, addr.3.byteSwapped,
-                        addr.4.byteSwapped, addr.5.byteSwapped, addr.6.byteSwapped, addr.7.byteSwapped
-                    ]
-                    
-                    // 格式化为标准 IPv6 字符串 [addr]:port
+                    let p = UInt16(bigEndian: sin6.pointee.sin6_port)
+                    // in6_addr's union member names differ between Darwin
+                    // (__u6_addr) and Glibc (__in6_u) — read raw bytes instead.
+                    let segments = withUnsafeBytes(of: sin6.pointee.sin6_addr) { raw -> [UInt16] in
+                        (0..<8).map { UInt16(bigEndian: raw.loadUnaligned(fromByteOffset: $0 * 2, as: UInt16.self)) }
+                    }
                     let ipStr = segments.map { String(format: "%x", $0) }.joined(separator: ":")
                     return "[\(ipStr)]:\(p)"
                 }
             }
         }
-        return ""
-        
+        return nil
     }
 
     private func logKcpSegments(_ label: String, data: Data) {

@@ -15,6 +15,10 @@ private struct LocalKcptunCase: Sendable {
     let requestURL: String
     let requestHostHeader: String
     let expectedResponseMarker: String
+    /// FEC group sizing — must match the kcptun-server's
+    /// `--datashard / --parityshard` flags. 0/0 disables FEC.
+    let dataShards: Int
+    let parityShards: Int
 }
 
 private enum LocalKcptunTestConfig {
@@ -41,6 +45,8 @@ private enum LocalKcptunTestConfig {
         let requestURL = env["SHANGHAI_PROXY_REQUEST_URL"] ?? "http://example.com/"
         let requestHostHeader = env["SHANGHAI_PROXY_REQUEST_HOST"] ?? "example.com"
         let expectedResponseMarker = env["SHANGHAI_EXPECT_RESPONSE_MARKER"] ?? "HTTP/"
+        let dataShards = Int(env["SHANGHAI_KCPTUN_DATASHARD"] ?? "0") ?? 0
+        let parityShards = Int(env["SHANGHAI_KCPTUN_PARITYSHARD"] ?? "0") ?? 0
         let cryptMethod: KcpPacketCryptoMethod
         switch crypt {
         case "aes":
@@ -65,7 +71,9 @@ private enum LocalKcptunTestConfig {
             requestMethod: requestMethod,
             requestURL: requestURL,
             requestHostHeader: requestHostHeader,
-            expectedResponseMarker: expectedResponseMarker
+            expectedResponseMarker: expectedResponseMarker,
+            dataShards: dataShards,
+            parityShards: parityShards
         )
     }
 
@@ -161,13 +169,24 @@ private func buildProxyRequest(for profile: LocalKcptunCase) -> Data {
         requestLineTarget = profile.requestURL
     }
 
-    return Data("""
-    \(profile.requestMethod) \(requestLineTarget) HTTP/1.1\r
-    Host: \(profile.requestHostHeader)\r
-    User-Agent: ShanghaiTests/1.0 (\(profile.name))\r
-    Proxy-Connection: Keep-Alive\r
-    \r
-    """.utf8)
+    // Build the request explicitly with `\r\n` separators. The
+    // earlier multiline-literal form ended with a stray `\r` (the
+    // `\n` right before `"""` is dropped by Swift), producing
+    // `Keep-Alive\r\n\r` — three of four CRLF-terminator bytes.
+    // python http.server's BaseHTTPRequestHandler kept waiting for
+    // the missing `\n` and never dispatched to do_GET, which is
+    // why every matrix case timed out at `didReceiveResponse`.
+    // The smux/KCP layers were always fine — only the test's
+    // payload was malformed.
+    let lines = [
+        "\(profile.requestMethod) \(requestLineTarget) HTTP/1.1",
+        "Host: \(profile.requestHostHeader)",
+        "User-Agent: ShanghaiTests/1.0 (\(profile.name))",
+        "Proxy-Connection: Keep-Alive",
+        "",
+        ""
+    ]
+    return Data(lines.joined(separator: "\r\n").utf8)
 }
 
 private func makeConnector(
@@ -188,7 +207,9 @@ private func makeConnector(
                 disableCongestionControl: 1,
                 streamMode: true,
                 preSharedKey: profile.password,
-                crypt: profile.crypt
+                crypt: profile.crypt,
+                dataShards: profile.dataShards,
+                parityShards: profile.parityShards
             ),
             smuxVersion: profile.smuxVersion,
             keepAliveInterval: 10,
