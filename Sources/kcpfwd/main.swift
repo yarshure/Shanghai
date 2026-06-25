@@ -201,6 +201,13 @@ configuration.preSharedKey = options.key
 configuration.crypt = options.crypt
 configuration.dataShards = options.dataShards
 configuration.parityShards = options.parityShards
+// Datagram mode: each forwarded WG UDP packet must map 1:1 to one KCP
+// message so boundaries survive the hop. KcpConfiguration defaults to
+// streamMode=true (byte-stream) — wrong for carrying discrete WG packets,
+// and it mismatches the iOS PacketTunnelProvider (which sets false), so only
+// KCP control frames cross and the WG handshake never reaches the far wg.
+// Both ends of a kcpfwd pair must agree; keep this false everywhere.
+configuration.streamMode = false
 // nodelay=1 interval=20 resend=2 nc=1 defaults already suit hub-to-hub.
 
 let forwarder = KcpUdpForwarder(
